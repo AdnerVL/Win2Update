@@ -1,0 +1,12 @@
+
+**Functionality**:
+- Creates `UpdateScript.ps1` with the provided PowerShell code.
+- Runs the script with `-ExecutionPolicy Bypass` to avoid policy restrictions.
+- Deletes the PowerShell script after execution to clean up.
+
+**Advice**:
+- Save the batch file as `RunUpdateScript.bat` and run it by double-clicking or via command prompt.
+- If UAC is enabled, a prompt may appear for elevation; this is unavoidable.
+- Ensure `C:\Tools` exists or modify `$logPath` to a valid directory.
+- Test the batch file in a non-admin context to verify elevation.
+- For repeated use, consider keeping `UpdateScript.ps1` instead of deleting it to avoid recreation overhead.
