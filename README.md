@@ -1,47 +1,99 @@
 # Windows Update and Software Upgrade Script
 
-<!-- Disclaimer: This script and documentation were created with the assistance of AI (GitHub Copilot and Grock). Please review and test before use in production environments. -->
+[![PowerShell](https://img.shields.io/badge/PowerShell-%235391FE.svg?style=for-the-badge&logo=powershell&logoColor=white)](https://learn.microsoft.com/powershell/)
+[![Windows](https://img.shields.io/badge/Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 
-This project provides a comprehensive batch and PowerShell-based solution for updating Windows and upgrading installed applications on a Windows system. It is designed to automate the process of keeping your system and software up to date, with detailed logging and optional reboot handling.
+<!-- Disclaimer: This script and documentation were created with the assistance of AI (GitHub Copilot). Please review and test before use in production environments. -->
 
-## Features
+A robust Windows system update automation solution that combines PowerShell and batch scripting to manage Windows Updates and application upgrades through winget. This script is designed for system administrators and power users who want to automate their Windows update process with detailed logging and error handling.
 
-- Updates Windows using the `PSWindowsUpdate` PowerShell module
-- Upgrades all installed applications using `winget`
-- Handles required reboots interactively
-- Creates detailed logs for both batch and PowerShell operations
-- Checks for administrator privileges and internet connectivity
+## 🚀 Features
 
-## Files
+- Automated Windows Updates using the `PSWindowsUpdate` module
+- Bulk application upgrades via `winget`
+- Automatic privilege elevation
+- Comprehensive error handling and logging
+- Safe execution with environment checks
+- Automatic module installation and configuration
+- Smart reboot handling with user interaction
+- Cleanup of temporary files
 
-- `RunUpdateScript.bat`: Main batch script to orchestrate the update process. It generates and runs a PowerShell script, manages logs, and handles errors and cleanup.
-- `UpdateScriptv1.ps1`: (Optional/legacy) Example or previous version of the PowerShell update script.
-- `Use.txt`: (Optional) May contain usage notes or additional information.
-
-## Usage
-
-1. **Run as Administrator:**
-   - Right-click `RunUpdateScript.bat` and select **Run as administrator**.
-2. **Follow Prompts:**
-   - The script will check for required permissions, internet connectivity, and then proceed to update Windows and installed applications.
-   - If a reboot is required, you will be prompted to reboot or skip.
-3. **Logs:**
-   - Logs are saved in `C:\Tools\Logs` or your `%TEMP%` directory if the default is unavailable.
-   - Log file names include timestamps for easy tracking.
-
-## Requirements
+## 📋 Prerequisites
 
 - Windows 10/11
-- PowerShell (included by default on modern Windows)
-- Internet access for updates
-- `winget` (Windows Package Manager) for application upgrades
+- PowerShell 5.1 or later
+- Internet connection
+- Administrator privileges
+- Windows Package Manager (`winget`)
 
-## Notes
+## 🛠️ Installation
 
-- The script will attempt to elevate privileges if not run as administrator.
-- If `winget` is not found, application upgrades will be skipped.
-- All actions and errors are logged for troubleshooting.
+1. Clone this repository or download the files:
+   ```powershell
+   git clone https://github.com/yourusername/Win2Update.git
+   ```
+2. Place the files in a permanent location (e.g., `C:\Tools\Git\Win2Update`)
 
-## License
+## 📦 Components
+
+- `RunUpdateScript.bat`: Main entry point that manages the update process
+- `UpdateScriptv1.ps1`: Core PowerShell update implementation
+- `Use.txt`: Additional usage notes and troubleshooting
+- `README.md`: This documentation file
+
+## 🚦 Usage
+
+1. **Run as Administrator:**
+   - Right-click `RunUpdateScript.bat`
+   - Select "Run as administrator"
+   - Or run from PowerShell (Admin):
+     ```powershell
+     & "C:\Tools\Git\Win2Update\RunUpdateScript.bat"
+     ```
+
+2. **Process Overview:**
+   - Checks for admin rights
+   - Verifies internet connectivity
+   - Installs/updates required PowerShell modules
+   - Runs Windows Update
+   - Upgrades installed applications
+   - Handles reboots if needed
+
+3. **Logging:**
+   - Batch log: `C:\Tools\Logs\UpdateAllLog_[DateTime].txt`
+   - PowerShell log: `C:\Tools\Logs\PSUpdateLog_[DateTime].txt`
+
+## ⚙️ Configuration
+
+The script automatically configures:
+- PowerShell execution policy (temporarily)
+- Windows Update service
+- Package providers (NuGet)
+- Required PowerShell modules
+
+## 🔍 Troubleshooting
+
+- Check logs in `C:\Tools\Logs\` for detailed error information
+- Ensure PowerShell is not restricted (`Get-ExecutionPolicy`)
+- Verify internet connectivity
+- Check Windows Update service is running
+- Ensure `winget` is installed for app upgrades
+
+## ⚠️ Important Notes
+
+- Always backup important data before running system updates
+- The script requires internet access for downloads
+- Some updates may require multiple reboots
+- Execution time varies based on available updates
+- Corporate environments may require additional configuration
+
+## 📄 License
 
 This project is provided as-is, without warranty. Use at your own risk.
+
+## 🤝 Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+---
+Last updated: May 23, 2025

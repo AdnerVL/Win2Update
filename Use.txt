@@ -1,12 +1,62 @@
+# Windows Update Script Usage Guide
 
-**Functionality**:
-- Creates `UpdateScript.ps1` with the provided PowerShell code.
-- Runs the script with `-ExecutionPolicy Bypass` to avoid policy restrictions.
-- Deletes the PowerShell script after execution to clean up.
+## Technical Details
 
-**Advice**:
-- Save the batch file as `RunUpdateScript.bat` and run it by double-clicking or via command prompt.
-- If UAC is enabled, a prompt may appear for elevation; this is unavoidable.
-- Ensure `C:\Tools` exists or modify `$logPath` to a valid directory.
-- Test the batch file in a non-admin context to verify elevation.
-- For repeated use, consider keeping `UpdateScript.ps1` instead of deleting it to avoid recreation overhead.
+### Script Components
+- `RunUpdateScript.bat`: Orchestrator script
+- `UpdateScript.ps1`: Generated PowerShell script (temporary)
+- Log files: Generated in C:\Tools\Logs with timestamps
+
+### Core Functionality
+1. Generates temporary PowerShell script with required configurations
+2. Manages execution policy and security settings
+3. Installs and configures required PowerShell modules
+4. Executes Windows Updates and application upgrades
+5. Handles reboots and cleanup
+
+### Security Features
+- Auto-elevation of privileges when needed
+- Temporary execution policy modification
+- Safe module installation and removal
+- Controlled cleanup of temporary files
+
+## Best Practices
+
+### Installation
+1. Place scripts in a permanent location (e.g., C:\Tools\Git\Win2Update)
+2. Ensure write access to log directory
+3. Run initial test with admin privileges
+
+### Regular Usage
+1. Schedule during off-peak hours
+2. Monitor logs for patterns/issues
+3. Keep backups before major updates
+4. Consider network impact
+
+### Troubleshooting Tips
+1. Check both log files for specific errors
+2. Verify module installation status
+3. Test network connectivity
+4. Confirm Windows Update service status
+5. Verify winget availability
+
+### Performance Optimization
+- Consider keeping UpdateScript.ps1 for frequent updates
+- Clean old logs periodically
+- Monitor disk space in log directory
+- Use scheduled tasks for automation
+
+### Corporate Environments
+1. Test in isolated environment first
+2. Verify proxy/firewall settings
+3. Check group policies
+4. Document any customizations
+
+## Support Information
+- Requires Windows 10/11
+- PowerShell 5.1 or later
+- Admin privileges
+- Internet connectivity
+- winget for app updates
+
+Last Updated: May 23, 2025
