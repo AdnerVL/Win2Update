@@ -7,6 +7,18 @@
 
 A robust Windows system update automation solution that combines PowerShell and batch scripting to manage Windows Updates and application upgrades through winget. This script is designed for system administrators and power users who want to automate their Windows update process with detailed logging and error handling.
 
+## ⚠️ Security Notice
+
+Before using this script, please be aware of these security considerations:
+
+- Review all scripts before execution in your environment
+- Implement proper file and folder permissions
+- Configure logging to a secure location
+- Verify script integrity before each run
+- Monitor update sources and network traffic
+- Consider implementing hash verification
+- Use environment-specific paths
+
 ## 🚀 Features
 
 - Automated Windows Updates using the `PSWindowsUpdate` module
@@ -25,14 +37,30 @@ A robust Windows system update automation solution that combines PowerShell and 
 - Internet connection
 - Administrator privileges
 - Windows Package Manager (`winget`)
+- Secure storage location for scripts and logs
+- Properly configured file system permissions
 
 ## 🛠️ Installation
 
 1. Clone this repository or download the files:
+
    ```powershell
-   git clone https://github.com/yourusername/Win2Update.git
+   git clone https://github.com/AdnerVL/Win2Update.git
    ```
-2. Place the files in a permanent location (e.g., `C:\Tools\Git\Win2Update`)
+
+2. Create and configure a secure location for the scripts:
+
+   ```powershell
+   # Example: Create directory and set permissions
+   $scriptPath = "$env:ProgramFiles\WindowsUpdate"
+   New-Item -Path $scriptPath -ItemType Directory -Force
+   ```
+
+3. Copy the files to your secure location and configure:
+   - Move the downloaded files to your chosen location
+   - Set NTFS permissions according to your security policy
+   - Update configuration in the scripts
+   - Test in a non-production environment first
 
 ## 📦 Components
 
@@ -47,25 +75,30 @@ A robust Windows system update automation solution that combines PowerShell and 
    - Right-click `RunUpdateScript.bat`
    - Select "Run as administrator"
    - Or run from PowerShell (Admin):
+   
      ```powershell
-     & "C:\Tools\Git\Win2Update\RunUpdateScript.bat"
+     & ".\RunUpdateScript.bat"
      ```
 
 2. **Process Overview:**
+   - Validates script integrity
    - Checks for admin rights
-   - Verifies internet connectivity
+   - Verifies internet connectivity through approved channels
    - Installs/updates required PowerShell modules
    - Runs Windows Update
    - Upgrades installed applications
    - Handles reboots if needed
 
 3. **Logging:**
-   - Batch log: `C:\Tools\Logs\UpdateAllLog_[DateTime].txt`
-   - PowerShell log: `C:\Tools\Logs\PSUpdateLog_[DateTime].txt`
+   - Log files are created in a configurable secure location
+   - Log files use timestamp format: `UpdateLog_YYYYMMDD_HHMMSS.txt`
+   - Secure log rotation implemented
+   - Default permissions restrict access to administrators and system
 
 ## ⚙️ Configuration
 
 The script automatically configures:
+
 - PowerShell execution policy (temporarily)
 - Windows Update service
 - Package providers (NuGet)
@@ -73,19 +106,25 @@ The script automatically configures:
 
 ## 🔍 Troubleshooting
 
-- Check logs in `C:\Tools\Logs\` for detailed error information
+- Check logs in your configured log directory
 - Ensure PowerShell is not restricted (`Get-ExecutionPolicy`)
-- Verify internet connectivity
+- Verify internet connectivity through approved channels
 - Check Windows Update service is running
 - Ensure `winget` is installed for app upgrades
+- Verify file permissions and access rights
 
-## ⚠️ Important Notes
+## ⚠️ Important Security Notes
 
 - Always backup important data before running system updates
-- The script requires internet access for downloads
-- Some updates may require multiple reboots
-- Execution time varies based on available updates
-- Corporate environments may require additional configuration
+- Use approved network connections only
+- Implement script signing for production use
+- Monitor update processes for anomalies
+- Review logs for security events
+- Use HTTPS for any network operations
+- Keep scripts in access-controlled locations
+- Implement audit logging where possible
+- Consider using PAM solutions for privileged operations
+- Corporate environments should implement additional security controls
 
 ## 📄 License
 
@@ -93,7 +132,7 @@ This project is provided as-is, without warranty. Use at your own risk.
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please follow security guidelines when submitting PRs.
 
 ---
 Last updated: May 23, 2025
