@@ -1,151 +1,137 @@
 @echo off
 setlocal EnableDelayedExpansion
 
-:: ====================================================
-:: Windows Update and Software Upgrade Script
-:: ====================================================
-echo ====================================================
-echo Windows Update and Software Upgrade Script
-echo ====================================================
-echo This script will:
-echo  - Update Windows using the PSWindowsUpdate module
-echo  - Upgrade installed applications using winget
-echo  - Reboot if required
-echo  - Create detailed logs of all operations
-echo ====================================================
-
-where powershell >nul 2>&1
-if errorlevel 1 (
-    echo Error: PowerShell is required but not found.
-    pause
+:: Guard against recursive invocation
+if defined RUNUPDATE_SCRIPT_INVOKED (
+    echo [ERROR] Script already running, exiting to prevent loop >> "%TEMP%\UpdateScriptDebug.txt"
     exit /b 1
 )
+set "RUNUPDATE_SCRIPT_INVOKED=1"
 
-for /f %%a in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "LogDateTime=%%a"
+:: Debug: Log start of script
+echo [DEBUG] Starting batch script at %date% %time% > "%TEMP%\UpdateScriptDebug.txt"
+echo [DEBUG] Current directory: %CD% >> "%TEMP%\UpdateScriptDebug.txt"
+echo [DEBUG] Script path: %~f0 >> "%TEMP%\UpdateScriptDebug.txt"
 
-set "LogDir=C:\Tools\Logs"
-if not exist "!LogDir!" (
-    mkdir "!LogDir!" 2>nul
-    if errorlevel 1 (
-        set "LogDir=%TEMP%"
+:: Set paths early
+set "SCRIPT_DIR=%~dp0"
+set "SCRIPT_DIR=!SCRIPT_DIR:~0,-1!"
+echo [DEBUG] SCRIPT_DIR set to: !SCRIPT_DIR! >> "%TEMP%\UpdateScriptDebug.txt"
+
+:: Verify script exists
+if not exist "%~f0" (
+    echo [ERROR] Script file not found: %~f0 >> "%TEMP%\UpdateScriptDebug.txt"
+    exit /b 1
+)
+echo [DEBUG] Script file verified: %~f0 >> "%TEMP%\UpdateScriptDebug.txt"
+
+:: Check for admin rights
+net session >nul 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    :: Debug: Log elevation attempt
+    echo [DEBUG] Not elevated, requesting elevation >> "%TEMP%\UpdateScriptDebug.txt"
+    :: Create VBScript for elevation
+    set "VBS_FILE=%TEMP%\Elevate_%RANDOM%.vbs"
+    echo [DEBUG] Creating VBScript: !VBS_FILE! >> "%TEMP%\UpdateScriptDebug.txt"
+    (echo Set UAC = CreateObject^("Shell.Application"^)
+     echo UAC.ShellExecute "cmd.exe", "/c ""%~f0""", "%CD%", "runas", 1) > "!VBS_FILE!" || (
+        echo [ERROR] Failed to create VBScript: !VBS_FILE! >> "%TEMP%\UpdateScriptDebug.txt"
+        exit /b 1
+    )
+    :: Debug: Log VBScript contents
+    echo [DEBUG] VBScript contents: >> "%TEMP%\UpdateScriptDebug.txt"
+    type "!VBS_FILE!" >> "%TEMP%\UpdateScriptDebug.txt" 2>nul
+    :: Run VBScript and capture output
+    cscript //nologo "!VBS_FILE!" > "%TEMP%\VBSOutput.txt" 2>&1
+    set "EXIT_CODE=%ERRORLEVEL%"
+    :: Log VBScript output
+    echo [DEBUG] VBScript output: >> "%TEMP%\UpdateScriptDebug.txt"
+    type "%TEMP%\VBSOutput.txt" >> "%TEMP%\UpdateScriptDebug.txt" 2>nul
+    :: Clean up VBScript and output
+    del "!VBS_FILE!" 2>nul
+    del "%TEMP%\VBSOutput.txt" 2>nul
+    echo [DEBUG] Elevation attempt completed with exit code !EXIT_CODE! >> "%TEMP%\UpdateScriptDebug.txt"
+    :: Fallback log if elevation fails
+    if !EXIT_CODE! NEQ 0 (
+        echo [ERROR] Elevation failed with exit code !EXIT_CODE! >> "%TEMP%\UpdateScriptDebug.txt"
+        for /f "delims=" %%a in ('powershell -NoProfile -Command "(Get-Date).ToString('yyyyMMdd_HHmmss')"') do set "TIMESTAMP=%%a"
+        echo [ERROR] Elevation failed. Check %TEMP%\UpdateScriptDebug.txt for details > "!SCRIPT_DIR!\Logs\ElevationFailure_!TIMESTAMP!.txt" 2>nul
+        exit /b !EXIT_CODE!
+    )
+    exit /b !EXIT_CODE!
+)
+
+:: Debug: Log elevated state
+echo [DEBUG] Running with admin rights at %date% %time% >> "%TEMP%\UpdateScriptDebug.txt"
+
+cd /d "!SCRIPT_DIR!" || (
+    echo [ERROR] Failed to set working directory: !SCRIPT_DIR! >> "%TEMP%\UpdateScriptDebug.txt"
+    exit /b 1
+)
+echo [DEBUG] Working directory set to: !SCRIPT_DIR! >> "%TEMP%\UpdateScriptDebug.txt"
+
+set "LOG_DIR=!SCRIPT_DIR!\Logs"
+set "TEMP_DIR=%TEMP%\Win2UpdateTemp"
+
+:: Validate TEMP_DIR
+if "!TEMP_DIR!"=="!SCRIPT_DIR!" (
+    echo [ERROR] TEMP_DIR matches SCRIPT_DIR, resetting to safe path >> "%TEMP%\UpdateScriptDebug.txt"
+    set "TEMP_DIR=%TEMP%\Win2UpdateTemp"
+)
+
+for /f "delims=" %%a in ('powershell -NoProfile -Command "(Get-Date).ToString('yyyyMMdd_HHmmss')"') do set "TIMESTAMP=%%a"
+set "LOG_FILE=!LOG_DIR!\UpdateLog_!TIMESTAMP!.txt"
+set "CONSOLE_LOG=!LOG_DIR!\UpdateLog_Console_!TIMESTAMP!.txt"
+
+:: Create directories with error handling
+if not exist "!LOG_DIR!" (
+    mkdir "!LOG_DIR!" || (
+        echo [ERROR] Failed to create log directory: !LOG_DIR! >> "%TEMP%\UpdateScriptDebug.txt"
+        exit /b 1
+    )
+    echo [DEBUG] Created log directory: !LOG_DIR! >> "%TEMP%\UpdateScriptDebug.txt"
+)
+
+if not exist "!TEMP_DIR!" (
+    mkdir "!TEMP_DIR!" || (
+        echo [ERROR] Failed to create temp directory: !TEMP_DIR! >> "%TEMP%\UpdateScriptDebug.txt"
+        exit /b 1
+    )
+    echo [DEBUG] Created temp directory: !TEMP_DIR! >> "%TEMP%\UpdateScriptDebug.txt"
+)
+
+:: Test log file access
+echo [DEBUG] Testing log file access: !LOG_FILE! >> "%TEMP%\UpdateScriptDebug.txt"
+(echo Test > "!LOG_FILE!" && del "!LOG_FILE!") || (
+    echo [ERROR] Cannot write to log file: !LOG_FILE! >> "%TEMP%\UpdateScriptDebug.txt"
+    exit /b 1
+)
+echo [DEBUG] Log file access test passed >> "%TEMP%\UpdateScriptDebug.txt"
+
+:: Run PowerShell script with real-time output
+echo [DEBUG] Running PowerShell script: !SCRIPT_DIR!\UpdateScriptv1.ps1 >> "%TEMP%\UpdateScriptDebug.txt"
+powershell -NoProfile -ExecutionPolicy Bypass -File "!SCRIPT_DIR!\UpdateScriptv1.ps1" -LogPath "!LOG_FILE!" -AutoReboot | more > "!CONSOLE_LOG!"
+set "EXIT_CODE=%ERRORLEVEL%"
+echo [DEBUG] PowerShell script completed with exit code !EXIT_CODE! >> "%TEMP%\UpdateScriptDebug.txt"
+
+:: Clean up old logs
+for /f "skip=5 delims=" %%F in ('dir /b /o-d "!LOG_DIR!\*.txt" 2>nul') do (
+    del "!LOG_DIR!\%%F" 2>nul
+    echo [DEBUG] Deleted old log: %%F >> "%TEMP%\UpdateScriptDebug.txt"
+)
+
+:: Clean up temp directory with protection
+if exist "!TEMP_DIR!" (
+    if "!TEMP_DIR!"=="!SCRIPT_DIR!" (
+        echo [ERROR] TEMP_DIR matches SCRIPT_DIR, skipping cleanup to prevent self-deletion >> "%TEMP%\UpdateScriptDebug.txt"
+    ) else (
+        rd /s /q "!TEMP_DIR!" 2>nul
+        if exist "!TEMP_DIR!" (
+            echo [ERROR] Failed to clean up temp directory: !TEMP_DIR! >> "%TEMP%\UpdateScriptDebug.txt"
+        ) else (
+            echo [DEBUG] Cleaned up temp directory >> "%TEMP%\UpdateScriptDebug.txt"
+        )
     )
 )
-echo test > "!LogDir!\test.tmp" 2>nul
-if errorlevel 1 (
-    set "LogDir=%TEMP%"
-)
-del "!LogDir!\test.tmp" 2>nul
 
-set "LogFile=!LogDir!\UpdateAllLog_%LogDateTime%.txt"
-echo %DATE% %TIME% - [BATCH] Starting batch script > "!LogFile!"
-
-echo %DATE% %TIME% - [BATCH] Checking for administrator privileges >> "!LogFile!"
->nul 2>&1 "%SYSTEMROOT%\system32\cacls.exe" "%SYSTEMROOT%\system32\config\system"
-if %errorlevel% NEQ 0 (
-    echo Set UAC = CreateObject^("Shell.Application"^) > "%TEMP%\elevate.vbs"
-    echo UAC.ShellExecute "%~s0", "", "", "runas", 1 >> "%TEMP%\elevate.vbs"
-    cscript //nologo "%TEMP%\elevate.vbs" >nul 2>&1
-    del "%TEMP%\elevate.vbs" 2>nul
-    exit /b
-) else (
-    echo %DATE% %TIME% - [BATCH] Running with administrator privileges >> "!LogFile!"
-)
-
-echo test > test.tmp 2>> "!LogFile!"
-if errorlevel 1 (
-    echo Error: Cannot write to %CD%.
-    pause
-    exit /b 1
-) else (
-    del test.tmp
-    echo %DATE% %TIME% - [BATCH] Write permissions confirmed >> "!LogFile!"
-)
-
-ping -n 1 -w 1000 8.8.8.8 >nul 2>&1
-if errorlevel 1 (
-    echo Warning: No internet connectivity detected.
-    choice /C YN /M "Continue anyway?"
-    if errorlevel 2 exit /b 1
-) else (
-    echo %DATE% %TIME% - [BATCH] Internet connectivity confirmed >> "!LogFile!"
-)
-
-set "PSLogFile=!LogDir!\PSUpdateLog_%LogDateTime%.txt"
-set "PSScriptPath=%~dp0UpdateScript_%RANDOM%.ps1"
-
-:: Build PowerShell script
-echo. > "!PSScriptPath!"
->> "!PSScriptPath!" echo param([string]$LogPath)
->> "!PSScriptPath!" echo $ErrorActionPreference = 'Stop'
->> "!PSScriptPath!" echo $ProgressPreference = 'SilentlyContinue'
->> "!PSScriptPath!" echo Start-Transcript -Path $LogPath -Append -Force
->> "!PSScriptPath!" echo try {
->> "!PSScriptPath!" echo     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
->> "!PSScriptPath!" echo     Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force
->> "!PSScriptPath!" echo     Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
->> "!PSScriptPath!" echo     if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
->> "!PSScriptPath!" echo         Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser
->> "!PSScriptPath!" echo     }
->> "!PSScriptPath!" echo     Import-Module PSWindowsUpdate
->> "!PSScriptPath!" echo     Add-WUServiceManager -MicrosoftUpdate -Confirm:$false
->> "!PSScriptPath!" echo     $updates = Get-WindowsUpdate -MicrosoftUpdate
->> "!PSScriptPath!" echo     if ($updates.Count -gt 0) {
->> "!PSScriptPath!" echo         Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot
->> "!PSScriptPath!" echo     } else {
->> "!PSScriptPath!" echo         Write-Host "No updates available"
->> "!PSScriptPath!" echo     }
->> "!PSScriptPath!" echo     if (Get-Command winget -ErrorAction SilentlyContinue) {
->> "!PSScriptPath!" echo         winget upgrade --all --include-unknown --silent --accept-package-agreements --accept-source-agreements
->> "!PSScriptPath!" echo     } else {
->> "!PSScriptPath!" echo         Write-Host "winget not found. Skipping app upgrades."
->> "!PSScriptPath!" echo     }
->> "!PSScriptPath!" echo     Write-Host "Checking if reboot is required..."
->> "!PSScriptPath!" echo     if ((Get-WURebootStatus -Silent) -eq $true) {
->> "!PSScriptPath!" echo         $choice = Read-Host "Updates complete. Reboot required. Reboot now? (Y/N)"
->> "!PSScriptPath!" echo         if ($choice -eq 'Y' -or $choice -eq 'y') {
->> "!PSScriptPath!" echo             Write-Host "Rebooting system..."
->> "!PSScriptPath!" echo             Restart-Computer -Force
->> "!PSScriptPath!" echo         } else {
->> "!PSScriptPath!" echo             Write-Host "Reboot skipped by user."
->> "!PSScriptPath!" echo         }
->> "!PSScriptPath!" echo     } else {
->> "!PSScriptPath!" echo         Write-Host "No reboot needed."
->> "!PSScriptPath!" echo     }
->> "!PSScriptPath!" echo } catch {
->> "!PSScriptPath!" echo     Write-Host "Error: $($_.Exception.Message)"
->> "!PSScriptPath!" echo } finally {
->> "!PSScriptPath!" echo     Stop-Transcript
->> "!PSScriptPath!" echo }
-
-if not exist "!PSScriptPath!" (
-    echo Error: PowerShell script creation failed.
-    pause
-    exit /b 1
-)
-
-echo %DATE% %TIME% - [BATCH] Running PowerShell update script >> "!LogFile!"
-powershell -NoProfile -ExecutionPolicy Bypass -File "!PSScriptPath!" -LogPath "!PSLogFile!" >> "!LogFile!" 2>&1
-set "PS_EXIT_CODE=%ERRORLEVEL%"
-
-:: Cleanup
-if %PS_EXIT_CODE% NEQ 0 (
-    echo %DATE% %TIME% - [BATCH] PowerShell script failed with exit code %PS_EXIT_CODE% >> "!LogFile!"
-    echo PowerShell script failed. See:
-    echo - Batch Log: !LogFile!
-    echo - PowerShell Log: !PSLogFile!
-    echo - Script Path: !PSScriptPath!
-    pause
-    exit /b %PS_EXIT_CODE%
-) else (
-    echo %DATE% %TIME% - [BATCH] PowerShell script executed successfully >> "!LogFile!"
-    del "!PSScriptPath!" 2>nul
-    echo Updates completed successfully.
-    echo Log files:
-    echo - Batch Log: !LogFile!
-    echo - PowerShell Log: !PSLogFile!
-)
-
-echo %DATE% %TIME% - [BATCH] Script finished >> "!LogFile!"
-echo Done. Press any key to exit.
-pause >nul
-endlocal
+exit /b !EXIT_CODE!

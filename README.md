@@ -75,7 +75,7 @@ Before using this script, please be aware of these security considerations:
    - Right-click `RunUpdateScript.bat`
    - Select "Run as administrator"
    - Or run from PowerShell (Admin):
-   
+
      ```powershell
      & ".\RunUpdateScript.bat"
      ```
@@ -95,6 +95,21 @@ Before using this script, please be aware of these security considerations:
    - Secure log rotation implemented
    - Default permissions restrict access to administrators and system
 
+## 🛠 Logging and Troubleshooting
+
+- **Log Files:**
+  - Logs are stored in the `Logs` directory.
+  - Example log files:
+    - `UpdateLog_<timestamp>.txt`
+    - `UpdateLog_<timestamp>.txt.winget`
+    - `UpdateLog_Console_<timestamp>.txt`
+
+- **Troubleshooting:**
+  - Check log files for errors and warnings.
+  - Ensure proper permissions on the `Logs` directory.
+  - Verify internet connectivity for updates.
+  - Use `-Verbose` flag for detailed output.
+
 ## ⚙️ Configuration
 
 The script automatically configures:
@@ -104,14 +119,10 @@ The script automatically configures:
 - Package providers (NuGet)
 - Required PowerShell modules
 
-## 🔍 Troubleshooting
+## 📅 Update History
 
-- Check logs in your configured log directory
-- Ensure PowerShell is not restricted (`Get-ExecutionPolicy`)
-- Verify internet connectivity through approved channels
-- Check Windows Update service is running
-- Ensure `winget` is installed for app upgrades
-- Verify file permissions and access rights
+- **June 9, 2025:** Added logging and troubleshooting section.
+- **May 23, 2025:** Initial release.
 
 ## ⚠️ Important Security Notes
 
@@ -135,4 +146,4 @@ This project is provided as-is, without warranty. Use at your own risk.
 Contributions are welcome! Please follow security guidelines when submitting PRs.
 
 ---
-Last updated: May 23, 2025
+Last updated: June 9, 2025

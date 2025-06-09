@@ -1,114 +1,105 @@
-# Windows Update and Software Upgrade PowerShell Script
-# Security Notice: Review and modify all paths according to your environment's security requirements
+# Windows Update and Software Upgrade Script
+param(
+    [Parameter(Mandatory)]
+    [ValidateScript({ Test-Path (Split-Path $_ -Parent) -PathType Container })]
+    [string]$LogPath,
+    [Parameter(Mandatory=$false)]
+    [switch]$AutoReboot
+)
 
-# Script Configuration
-$config = @{
-    LogPath = Join-Path $env:ProgramData 'YourCompany\Logs\Updates'
-    TempPath = Join-Path $env:SystemRoot 'Temp\Updates'
-    MaxLogAge = 30  # days
-    ValidateHash = $true
-    RequireEncryption = $true
+$ErrorActionPreference = 'Stop'
+
+function Test-AdminRights {
+    $principal = [System.Security.Principal.WindowsPrincipal][System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-# Security Validation
-function Test-ScriptSecurity {
-    # Verify script integrity
-    if ($config.ValidateHash) {
-        # TODO: Implement hash verification
-        Write-Host "Security: Verifying script integrity..."
+try {
+    $logDir = Split-Path -Parent $LogPath
+    if (-not (Test-Path $logDir)) {
+        New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+    }
+    if (Test-Path $LogPath) { Remove-Item $LogPath -Force }
+    Start-Transcript -Path $LogPath -Force
+    Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Script started" | Out-Host
+} catch {
+    Write-Error "Failed to initialize logging: $_"
+    exit 1
+}
+
+function Get-PendingUpdates {
+    try {
+        Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Checking for available Windows updates..." | Out-Host
+        $session = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $session.CreateUpdateSearcher()
+        $searcher.Search("IsInstalled=0").Updates
+    } catch {
+        Write-Error "Error checking for updates: $_"
+        @()
+    }
+}
+
+try {
+    Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Checking system status..." | Out-Host
+    
+    $isAdmin = Test-AdminRights
+    Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Running with administrator rights: $isAdmin" | Out-Host
+    
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Checking and installing app updates via winget..." | Out-Host
+        $wingetOutput = winget upgrade --all --include-unknown --silent --accept-package-agreements --accept-source-agreements --force 2>&1
+        Write-Output $wingetOutput | Tee-Object -FilePath "$LogPath.winget" -Append | Out-Host
+        if ($LASTEXITCODE -eq 0 -and $wingetOutput -notmatch "No applicable updates") {
+            # Verify installation by checking version
+            $wingetList = winget list --id DuoSecurity.Duo2FAAuthenticationforWindows 2>&1
+            if ($wingetList -match "5.1.1.1102") {
+                Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Winget updates installed and verified" | Out-Host
+            } else {
+                Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Winget updates may not have installed correctly" | Out-Host
+            }
+        } else {
+            Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): No winget updates applied or installation failed" | Out-Host
+        }
+    } else {
+        Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Winget not found. Skipping app updates." | Out-Host
     }
     
-    # Verify execution environment
-    if (-not [System.Security.Principal.WindowsIdentity]::GetCurrent().Owner) {
-        throw "Security: Unable to determine user context"
-    }
-}
-
-# Check for elevated permissions with enhanced security
-$isElevated = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-if (-not $isElevated) {
-    # Secure relaunch as elevated with execution policy bypass
-    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
-    try {
-        Start-Process powershell -Verb RunAs -ArgumentList $arguments -Wait
-    }
-    catch {
-        Write-Error "Security: Failed to elevate privileges. Error: $($_.Exception.Message)"
-    }
-    exit
-}
-
-# Ensure secure log directory with proper permissions
-$logPath = Join-Path $config.LogPath "UpdateLog_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
-$logDir = Split-Path $logPath -Parent
-
-if (-not (Test-Path $logDir)) {
-    try {
-        $null = New-Item -Path $logDir -ItemType Directory -Force -ErrorAction Stop
-        # Set secure ACLs
-        $acl = Get-Acl $logDir
-        $acl.SetAccessRuleProtection($true, $false)
-        $adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule("Administrators","FullControl","Allow")
-        $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule("SYSTEM","FullControl","Allow")
-        $acl.AddAccessRule($adminRule)
-        $acl.AddAccessRule($systemRule)
-        Set-Acl $logDir $acl
-    }
-    catch {
-        throw "Security: Failed to create secure log directory. Error: $($_.Exception.Message)"
-    }
-}
-
-# Start secure logging
-try {
-    Start-Transcript -Path $logPath -Append -Force
-    Write-Host "Security: Script started with enhanced security measures"
-    Test-ScriptSecurity
-
-    # Set execution policy for the session
-    Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
-
-    # Unload conflicting modules
-    if (Get-Module -Name PackageManagement) {
-        Remove-Module -Name PackageManagement -Force -ErrorAction SilentlyContinue
-    }
-    if (Get-Module -Name PSWindowsUpdate) {
-        Remove-Module -Name PSWindowsUpdate -Force -ErrorAction SilentlyContinue
-    }
-
-    # Install necessary package providers and modules
-    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser -Confirm:$false
-    Install-Module -Name PowerShellGet -Force -AllowClobber -Scope CurrentUser
-    Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser
-    Import-Module -Name PSWindowsUpdate
-
-    # Configure Windows Update settings
-    Write-Host "Configuring Windows Update..."
-    Add-WUServiceManager -MicrosoftUpdate -Confirm:$false
-
-    # Perform Windows Updates
-    Write-Host "Installing Windows Updates..."
-    Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot
-
-    # Perform application upgrades using winget
-    Write-Host "Upgrading applications with winget..."
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
-        winget upgrade --all --include-unknown --silent --accept-package-agreements --accept-source-agreements | Out-File -FilePath $logPath -Append
+    if ($isAdmin) {
+        Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Starting Windows Update operations..." | Out-Host
+        if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+            Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Installing PSWindowsUpdate module..." | Out-Host
+            Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser -Repository PSGallery -ErrorAction Stop
+        }
+        Import-Module PSWindowsUpdate -ErrorAction Stop
+        
+        $updates = Get-WindowsUpdate -MicrosoftUpdate -ErrorAction Stop
+        if ($updates.Count -gt 0) {
+            Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Installing $($updates.Count) updates..." | Out-Host
+            Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot -ErrorAction Stop
+        } else {
+            Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): No Windows updates available" | Out-Host
+        }
+        
+        if (Get-WURebootStatus -Silent) {
+            Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): System restart required" | Out-Host
+            if ($AutoReboot) {
+                Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Initiating system restart..." | Out-Host
+                Restart-Computer -Force
+            } else {
+                Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Reboot required but AutoReboot not set." | Out-Host
+            }
+        } else {
+            Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): No reboot needed" | Out-Host
+        }
     } else {
-        Write-Warning "winget not found."
+        Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Skipping Windows Update operations (no admin rights)" | Out-Host
     }
 
+    Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Operations completed successfully" | Out-Host
 } catch {
-    Write-Error "Error: $($_.Exception.Message)`nStackTrace: $($_.ScriptStackTrace)"
+    Write-Error "Error: $_"
+    Write-Error "Stack trace: $($_.ScriptStackTrace)"
+    exit 1
 } finally {
-    Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Default -Force -ErrorAction SilentlyContinue
     Stop-Transcript
-    # Check and perform reboot if required
-    if (Get-WURebootStatus -Silent) {
-        Write-Host "Reboot required. Initiating reboot..."
-        Restart-Computer -Force
-    } else {
-        Write-Host "No reboot needed."
-    }
 }

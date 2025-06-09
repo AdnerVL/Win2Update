@@ -77,4 +77,23 @@
 - Controlled internet access
 - Approved winget configuration
 
-Last Updated: May 23, 2025
+## Logging and Troubleshooting
+
+### Log Files
+- Logs are stored in the `Logs` directory.
+- Example log files:
+  - `UpdateLog_<timestamp>.txt`
+  - `UpdateLog_<timestamp>.txt.winget`
+  - `UpdateLog_Console_<timestamp>.txt`
+
+### Troubleshooting
+1. Check log files for errors and warnings.
+2. Ensure proper permissions on the `Logs` directory.
+3. Verify internet connectivity for updates.
+4. Use `-Verbose` flag for detailed output.
+
+### Update History
+- **June 9, 2025:** Added logging and troubleshooting section.
+- **May 23, 2025:** Initial release.
+
+Last Updated: June 9, 2025
