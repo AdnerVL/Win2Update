@@ -1,13 +1,6 @@
 @echo off
 setlocal EnableDelayedExpansion
 
-:: Guard against recursive invocation
-if defined RUNUPDATE_SCRIPT_INVOKED (
-    echo [ERROR] Script already running, exiting to prevent loop >> "%TEMP%\UpdateScriptDebug.txt"
-    exit /b 1
-)
-set "RUNUPDATE_SCRIPT_INVOKED=1"
-
 :: Debug: Log start of script
 echo [DEBUG] Starting batch script at %date% %time% > "%TEMP%\UpdateScriptDebug.txt"
 echo [DEBUG] Current directory: %CD% >> "%TEMP%\UpdateScriptDebug.txt"
@@ -34,7 +27,7 @@ if %ERRORLEVEL% NEQ 0 (
     set "VBS_FILE=%TEMP%\Elevate_%RANDOM%.vbs"
     echo [DEBUG] Creating VBScript: !VBS_FILE! >> "%TEMP%\UpdateScriptDebug.txt"
     (echo Set UAC = CreateObject^("Shell.Application"^)
-     echo UAC.ShellExecute "cmd.exe", "/c ""%~f0""", "%CD%", "runas", 1) > "!VBS_FILE!" || (
+     echo UAC.ShellExecute "%~f0", "", "%CD%", "runas", 1) > "!VBS_FILE!" || (
         echo [ERROR] Failed to create VBScript: !VBS_FILE! >> "%TEMP%\UpdateScriptDebug.txt"
         exit /b 1
     )
@@ -71,7 +64,7 @@ cd /d "!SCRIPT_DIR!" || (
 echo [DEBUG] Working directory set to: !SCRIPT_DIR! >> "%TEMP%\UpdateScriptDebug.txt"
 
 set "LOG_DIR=!SCRIPT_DIR!\Logs"
-set "TEMP_DIR=%TEMP%\Win2UpdateTemp"
+set "TEMP_DIR=!SCRIPT_DIR!\Temp"
 
 :: Validate TEMP_DIR
 if "!TEMP_DIR!"=="!SCRIPT_DIR!" (
@@ -108,14 +101,14 @@ echo [DEBUG] Testing log file access: !LOG_FILE! >> "%TEMP%\UpdateScriptDebug.tx
 )
 echo [DEBUG] Log file access test passed >> "%TEMP%\UpdateScriptDebug.txt"
 
-:: Run PowerShell script with real-time output
+:: Run PowerShell script
 echo [DEBUG] Running PowerShell script: !SCRIPT_DIR!\UpdateScriptv1.ps1 >> "%TEMP%\UpdateScriptDebug.txt"
-powershell -NoProfile -ExecutionPolicy Bypass -File "!SCRIPT_DIR!\UpdateScriptv1.ps1" -LogPath "!LOG_FILE!" -AutoReboot | more > "!CONSOLE_LOG!"
-set "EXIT_CODE=%ERRORLEVEL%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "!SCRIPT_DIR!\UpdateScriptv1.ps1" -LogPath "!LOG_FILE!" -AutoReboot > "!CONSOLE_LOG!" 2>&1
+set "EXIT_CODE=!ERRORLEVEL!"
 echo [DEBUG] PowerShell script completed with exit code !EXIT_CODE! >> "%TEMP%\UpdateScriptDebug.txt"
 
 :: Clean up old logs
-for /f "skip=5 delims=" %%F in ('dir /b /o-d "!LOG_DIR!\*.txt" 2>nul') do (
+for /f "skip=5 delims=" %%F in ('dir /b /o-d "!LOG_DIR!\*.txt" 2^>nul') do (
     del "!LOG_DIR!\%%F" 2>nul
     echo [DEBUG] Deleted old log: %%F >> "%TEMP%\UpdateScriptDebug.txt"
 )
