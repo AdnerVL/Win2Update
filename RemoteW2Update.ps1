@@ -68,39 +68,41 @@ foreach ($targetHost in $hosts) {
     try {
         # Use PsExec to run the update/upgrade block as SYSTEM/admin on the remote host
         # This ensures all update actions run with full privileges and avoids UAC/PSRemoting issues
-        .\PsExec.exe \\$targetHost -h powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+        .\PsExec.exe -nobanner \\$targetHost -h powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
             # Set strict error handling
             $ErrorActionPreference = 'Stop'
 
-            # Set execution policy to allow module installation (for this user only)
+            Write-Output '[Remote] Setting execution policy...'
             Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
 
-            # Ensure PowerShellGet is available for module management
+            Write-Output '[Remote] Checking PowerShellGet...'
             if (-not (Get-Module -Name PowerShellGet -ListAvailable)) {
+                Write-Output '[Remote] Installing NuGet and PowerShellGet...'
                 Install-PackageProvider -Name NuGet -Force -Scope CurrentUser
                 Install-Module -Name PowerShellGet -Force -Scope CurrentUser -Repository PSGallery
             }
             Import-Module PowerShellGet
 
-            # Install and import PSWindowsUpdate module for Windows Update management
+            Write-Output '[Remote] Installing PSWindowsUpdate...'
             Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser -Repository PSGallery
             Import-Module PSWindowsUpdate
 
-            # Run Windows Update (no reboot)
+            Write-Output '[Remote] Running Windows Update...'
             Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -IgnoreReboot
 
-            # Ensure winget is available, install if missing
+            Write-Output '[Remote] Checking winget...'
             if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+                Write-Output '[Remote] Installing winget...'
                 $wingetInstallerUrl = 'https://github.com/microsoft/winget-cli/releases/latest/download/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle'
                 $wingetInstallerPath = "$env:TEMP\winget.msixbundle"
                 Invoke-WebRequest -Uri $wingetInstallerUrl -OutFile $wingetInstallerPath -UseBasicParsing
                 Add-AppxPackage -Path $wingetInstallerPath
             }
 
-            # Upgrade all available packages via winget
+            Write-Output '[Remote] Upgrading all packages with winget...'
             winget upgrade --all --include-unknown --silent --accept-package-agreements --accept-source-agreements --force
 
-            # Trigger MDM app update scan (for managed environments)
+            Write-Output '[Remote] Triggering MDM app update scan...'
             Get-CimInstance -Namespace 'Root\\cimv2\\mdm\\dmmap' -ClassName 'MDM_EnterpriseModernAppManagement_AppManagement01' | Invoke-CimMethod -MethodName UpdateScanMethod
         "
         Write-Host "  SUCCESS: $targetHost update completed."
