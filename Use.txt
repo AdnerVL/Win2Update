@@ -23,24 +23,25 @@
 
 ## Technical Implementation
 
+
 ### Script Components
 - Main batch script (administrator execution required)
-- Generated PowerShell script (temporary, secured location)
+- PowerShell script for remote updates (PsExec-based, no WinRM/PSRemoting required)
 - Log files (secured with proper ACLs)
 
 ### Core Functionality
 1. Security validation and integrity checks
 2. Privilege management and elevation
 3. Secure module installation and verification
-4. Update execution in isolated context
+4. Update execution on remote hosts using PsExec
 5. Secure logging and cleanup
 
-### Security Features
 - Automated privilege handling
 - Temporary execution policy modification
 - Secure module installation
 - Protected file operations
 - Audit logging capability
+- No WinRM/PSRemoting required; all remote actions use PsExec
 
 ## Best Practices
 
@@ -50,11 +51,13 @@
 3. Configure environment-specific paths
 4. Test in isolated environment first
 
+
 ### Regular Usage
 1. Run during approved maintenance windows
 2. Monitor for security events
 3. Review logs for anomalies
 4. Use approved network paths only
+5. Ensure PsExec is available and allowed by endpoint security
 
 ### Corporate Environment
 1. Implement change control procedures
@@ -86,11 +89,13 @@
   - `UpdateLog_<timestamp>.txt.winget`
   - `UpdateLog_Console_<timestamp>.txt`
 
+
 ### Troubleshooting
 1. Check log files for errors and warnings.
 2. Ensure proper permissions on the `Logs` directory.
 3. Verify internet connectivity for updates.
 4. Use `-Verbose` flag for detailed output.
+5. Ensure PsExec is not blocked by antivirus or endpoint protection.
 
 ### Update History
 - **June 9, 2025:** Added logging and troubleshooting section.

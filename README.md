@@ -65,7 +65,7 @@ Before using this script, please be aware of these security considerations:
 
 ## 📦 Components
 
-- `RemoteW2Update.ps1`: Main PowerShell script for remote, multi-host Windows and app updates. Handles queueing, error logging, WinRM/PSRemoting setup, and can retry unreachable hosts.
+- `RemoteW2Update.ps1`: Main PowerShell script for remote, multi-host Windows and app updates. Handles queueing, error logging, and can retry unreachable hosts. Uses PsExec for all remote execution (no WinRM/PSRemoting required).
 - `UpdateScriptv1.ps1`: Standalone PowerShell script for local Windows and app updates, with logging, admin check, and optional auto-reboot.
 - `RunRemoteW2Update.bat`: Batch file to launch `RemoteW2Update.ps1` with correct PowerShell policy.
 - `RunUpdateScript.bat`: Batch file for launching `UpdateScriptv1.ps1` with elevation and debug logging.
@@ -92,6 +92,7 @@ Before using this script, please be aware of these security considerations:
    - Runs `UpdateScriptv1.ps1` to update Windows and apps using winget
    - Handles logging and optional auto-reboot
 
+
 ### Remote (Multi-Host) Update
 1. **Prepare `hosts.txt`:**
    - List all target hostnames or IPs, one per line
@@ -104,9 +105,8 @@ Before using this script, please be aware of these security considerations:
 3. **What it does:**
    - Reads `hosts.txt` for targets
    - Queues unreachable hosts in `hostQueue.txt` for retry (auto-managed)
-   - Sets up WinRM/PSRemoting on remote hosts if needed
-   - Runs Windows and app updates remotely, with error logging to `errorLog.txt`
-   - Logs all update activity in `Logs/`
+   - Uses PsExec to run all update and upgrade steps on each remote host with full admin rights (no WinRM/PSRemoting required)
+   - Logs errors to `errorLog.txt` and all update activity in `Logs/`
 
 ### Logging and Error Handling
 - Log files are created in the `Logs` directory for each run
@@ -125,6 +125,7 @@ Before using this script, please be aware of these security considerations:
     - `UpdateLog_Console_<timestamp>.txt`
   - Remote error log: `errorLog.txt`
   - Host queue for retry: `hostQueue.txt`
+  - No WinRM/PSRemoting configuration is required or performed
 
 - **Troubleshooting:**
   - Check log files for errors and warnings.
