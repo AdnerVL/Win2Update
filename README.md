@@ -62,38 +62,58 @@ Before using this script, please be aware of these security considerations:
    - Update configuration in the scripts
    - Test in a non-production environment first
 
+
 ## 📦 Components
 
-- `RunUpdateScript.bat`: Main entry point that manages the update process
-- `UpdateScriptv1.ps1`: Core PowerShell update implementation
-- `Use.txt`: Additional usage notes and troubleshooting
-- `README.md`: This documentation file
+- `RemoteW2Update.ps1`: Main PowerShell script for remote, multi-host Windows and app updates. Handles queueing, error logging, WinRM/PSRemoting setup, and can retry unreachable hosts.
+- `UpdateScriptv1.ps1`: Standalone PowerShell script for local Windows and app updates, with logging, admin check, and optional auto-reboot.
+- `RunRemoteW2Update.bat`: Batch file to launch `RemoteW2Update.ps1` with correct PowerShell policy.
+- `RunUpdateScript.bat`: Batch file for launching `UpdateScriptv1.ps1` with elevation and debug logging.
+- `hosts.txt`: List of target hostnames/IPs for remote updates (used by `RemoteW2Update.ps1`).
+- `hostQueue.txt`: Tracks hosts that failed or are queued for retry (auto-managed, ignored by git).
+- `errorLog.txt`: Error log for remote update failures (auto-managed, ignored by git).
+- `Logs/`: Contains update and console logs for each run.
+- `.gitignore`: Excludes `.exe`, `.txt`, log, and queue files from version control.
+- `Use.txt`: Security and usage best practices.
+- `README.md`: This documentation file.
+
 
 ## 🚦 Usage
 
+### Local (Single Machine) Update
 1. **Run as Administrator:**
-   - Right-click `RunUpdateScript.bat`
-   - Select "Run as administrator"
+   - Right-click `RunUpdateScript.bat` and select "Run as administrator"
    - Or run from PowerShell (Admin):
-
      ```powershell
      & ".\RunUpdateScript.bat"
      ```
+2. **What it does:**
+   - Checks for admin rights and elevates if needed
+   - Runs `UpdateScriptv1.ps1` to update Windows and apps using winget
+   - Handles logging and optional auto-reboot
 
-2. **Process Overview:**
-   - Validates script integrity
-   - Checks for admin rights
-   - Verifies internet connectivity through approved channels
-   - Installs/updates required PowerShell modules
-   - Runs Windows Update
-   - Upgrades installed applications
-   - Handles reboots if needed
+### Remote (Multi-Host) Update
+1. **Prepare `hosts.txt`:**
+   - List all target hostnames or IPs, one per line
+2. **Run as Administrator:**
+   - Right-click `RunRemoteW2Update.bat` and select "Run as administrator"
+   - Or run from PowerShell (Admin):
+     ```powershell
+     & ".\RunRemoteW2Update.bat"
+     ```
+3. **What it does:**
+   - Reads `hosts.txt` for targets
+   - Queues unreachable hosts in `hostQueue.txt` for retry (auto-managed)
+   - Sets up WinRM/PSRemoting on remote hosts if needed
+   - Runs Windows and app updates remotely, with error logging to `errorLog.txt`
+   - Logs all update activity in `Logs/`
 
-3. **Logging:**
-   - Log files are created in a configurable secure location
-   - Log files use timestamp format: `UpdateLog_YYYYMMDD_HHMMSS.txt`
-   - Secure log rotation implemented
-   - Default permissions restrict access to administrators and system
+### Logging and Error Handling
+- Log files are created in the `Logs` directory for each run
+- Remote errors are logged in `errorLog.txt`
+- Hosts that fail or are unreachable are queued in `hostQueue.txt` for later retry
+- All `.txt` and `.exe` files, logs, and queue files are excluded from git by `.gitignore`
+
 
 ## 🛠 Logging and Troubleshooting
 
@@ -103,12 +123,15 @@ Before using this script, please be aware of these security considerations:
     - `UpdateLog_<timestamp>.txt`
     - `UpdateLog_<timestamp>.txt.winget`
     - `UpdateLog_Console_<timestamp>.txt`
+  - Remote error log: `errorLog.txt`
+  - Host queue for retry: `hostQueue.txt`
 
 - **Troubleshooting:**
   - Check log files for errors and warnings.
   - Ensure proper permissions on the `Logs` directory.
   - Verify internet connectivity for updates.
   - Use `-Verbose` flag for detailed output.
+  - For remote updates, check `errorLog.txt` and `hostQueue.txt` for issues and retry status.
 
 ## ⚙️ Configuration
 

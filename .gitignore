@@ -1,0 +1,10 @@
+# Ignore all exe and txt files
+*.exe
+*.txt
+
+# Optionally ignore log files in Logs folder
+Logs/*.txt
+Logs/*.winget
+
+# Ignore hostQueue.txt if not needed in repo
+hostQueue.txt
