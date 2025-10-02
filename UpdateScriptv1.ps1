@@ -1,10 +1,7 @@
 # Windows Update and Software Upgrade Script
 param(
     [Parameter(Mandatory)]
-    [ValidateScript({ Test-Path (Split-Path $_ -Parent) -PathType Container })]
-    [string]$LogPath,
-    [Parameter(Mandatory=$false)]
-    [switch]$AutoReboot
+    [string]$LogPath
 )
 
 $ErrorActionPreference = 'Stop'

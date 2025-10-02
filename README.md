@@ -68,14 +68,15 @@ Before using this script, please be aware of these security considerations:
 
 - `RemoteW2Update.ps1`: Main PowerShell script for remote, multi-host Windows and app updates. Handles queueing, error logging, and can retry unreachable hosts. Uses PsExec for all remote execution (no WinRM/PSRemoting required).
 - `RemoteW2Update_Improved.ps1`: Improved version of the remote script with enhanced error handling, optional parallelism for multiple hosts, structured JSON logging, and configurability (including winget hash verification).
-- `AdvancedRemoteUpdate.ps1`: Advanced remote update script with YAML-based tracking to skip hosts updated within a configurable period (default 5 days). Includes Windows Checks, winget upgrades, and firmware/driver updates via MSUpdate. Supports auto-reboot and detailed status tracking.
+- `AdvancedRemoteUpdate.ps1`: Advanced remote update script with built-in YAML-based tracking (hosts_tracking.yaml) to skip hosts updated within a configurable period (default 5 days). Performs Windows Updates, winget upgrades, firmware/driver updates via MSUpdate, and optional auto-reboot. Uses PsExec for remote execution (no WinRM/PSRemoting required), includes queue management with 3-hour retry for failures/unreachable hosts, connectivity checks, structured JSON logging (.logs directory), and handles timeouts up to 15 minutes per host. Implements own YAML parser without external module dependency.
 - `UpdateScriptv1.ps1`: Standalone PowerShell script for local Windows and app updates, with logging, admin check, and optional auto-reboot.
 - `RunRemoteW2Update.bat`: Batch file to launch `RemoteW2Update.ps1` with correct PowerShell policy.
 - `RunUpdateScript.bat`: Batch file for launching `UpdateScriptv1.ps1` with elevation and debug logging.
 - `hosts.txt`: List of target hostnames/IPs for remote updates (used by `RemoteW2Update.ps1`).
 - `hostQueue.txt`: Tracks hosts that failed or are queued for retry (auto-managed, ignored by git).
 - `errorLog.txt`: Error log for remote update failures (auto-managed, ignored by git).
-- `Logs/`: Contains update and console logs for each run.
+- `Logs/`: Contains update and console logs for local/remote scripts (e.g., via UpdateScriptv1.ps1 or RemoteW2Update.ps1).
+- `.logs/`: Auto-created directory for structured JSON logs from AdvancedRemoteUpdate.ps1.
 - `.gitignore`: Excludes `.exe`, `.txt`, log, and queue files from version control.
 - `Use.txt`: Security and usage best practices.
 - `README.md`: This documentation file.
@@ -121,12 +122,28 @@ Before using this script, please be aware of these security considerations:
      ```powershell
      & ".\RunAdvancedUpdate.bat"
      ```
-3. **What it does:**
-   - Tracks update status in a YAML file to skip hosts updated within 5 days (configurable)
+3. **Example Commands:**
+   - Run with default settings (5-day skip, auto-reboot off, 3-hour retry):
+     ```powershell
+     .\AdvancedRemoteUpdate.ps1
+     ```
+   - Force retry all queued hosts and enable auto-reboot:
+     ```powershell
+     .\AdvancedRemoteUpdate.ps1 -ForceRetry -AutoReboot -Debug
+     ```
+   - Skip queue completely and change skip days to 7:
+     ```powershell
+     .\AdvancedRemoteUpdate.ps1 -SkipQueue -SkipDays 7
+     ```
+   - Specify custom files and retry after 30 minutes:
+     ```powershell
+     .\AdvancedRemoteUpdate.ps1 -QueueDuration 1800 -HostsFile "myhosts.txt" -YamlFile "custom.yaml"
+     ```
+4. **What it does:**
+   - Tracks update status in a YAML file (.logs directory for structured logs) to skip hosts updated within configurable days (default 5)
    - Performs Windows Updates (including firmware/drivers via MSUpdate), winget upgrades, and optional auto-reboot
-   - Queues unreachable/failed hosts for retry (default 3 hours)
-   - Uses JSON-structured logging for successes and errors
-   - Requires Powershell-Yaml module (auto-installed if missing)
+   - Queues unreachable/failed hosts for retry (default 3 hours, configurable)
+   - Uses JSON-structured logging for successes and errors (no external YAML module required; built-in parser)
 
 ### Logging and Error Handling
 - Log files are created in the `Logs` directory for each run
@@ -165,6 +182,7 @@ The script automatically configures:
 
 ## 📅 Update History
 
+- **October 2, 2025:** Analyzed RunAdvancedUpdate.bat and AdvancedRemoteUpdate.ps1, updated documentation with detailed usage examples, expanded component descriptions, security enhancements from Use.txt integration, and log directory clarifications.
 - **October 1, 2025:** Added AdvancedRemoteUpdate.ps1 script and updated documentation.
 - **June 9, 2025:** Added logging and troubleshooting section.
 - **May 23, 2025:** Initial release.
@@ -182,6 +200,22 @@ The script automatically configures:
 - Consider using PAM solutions for privileged operations
 - Corporate environments should implement additional security controls
 
+### Access Controls
+1. Script directory: Admins (Full), System (Full)
+2. Log directory: Service Account (Write), Admins (Full)
+3. Temp directory: Service Account (Full), cleaned after execution
+
+### Performance & Security
+- Implement log rotation
+- Monitor disk space
+- Clean temporary files
+- Review access logs
+- Validate update sources
+- Ensure PsExec is available and allowed by endpoint security
+- Use approved proxy settings where applicable
+
+**See Use.txt for detailed security and usage best practices, including NTFS permissions, PAM integration, approved paths, and corporate environment guidance.**
+
 ## 📄 License
 
 This project is provided as-is, without warranty. Use at your own risk.
@@ -191,4 +225,4 @@ This project is provided as-is, without warranty. Use at your own risk.
 Contributions are welcome! Please follow security guidelines when submitting PRs.
 
 ---
-Last updated: October 1, 2025
+Last updated: October 2, 2025

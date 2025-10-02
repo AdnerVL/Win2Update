@@ -57,7 +57,8 @@ param(
     [int]$SkipDays = 5,
     [switch]$ForceRetry = $false,
     [switch]$SkipQueue = $false,
-    [switch]$Debug = $false
+    [switch]$Debug = $false,
+    [switch]$Log = $true
 )
 
 # Set error handling preferences
@@ -187,32 +188,6 @@ if (-not $PsExecPath) {
         }
     }
 }
-
-# Check admin rights and elevate if needed
-$currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-$principal = New-Object System.Security.Principal.WindowsPrincipal($currentIdentity)
-$isAdmin = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
-
-if (-not $isAdmin) {
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Script requires administrative privileges. Attempting to elevate..."
-    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
-    foreach ($key in $PSBoundParameters.Keys) {
-        $value = $PSBoundParameters[$key]
-        if ($value -is [System.Management.Automation.SwitchParameter]) {
-            if ($value) { $arguments += " -$key" }
-        } else {
-            $arguments += " -$key `"$value`""
-        }
-    }
-    try {
-        Start-Process powershell.exe -Verb RunAs -ArgumentList $arguments -Wait
-        exit
-    } catch {
-        Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to elevate privileges: $_"
-        exit 1
-    }
-}
-
 
 # YAML handling is now done with built-in functions
 
@@ -493,7 +468,6 @@ function Invoke-RemoteUpdate {
     param(
         [string]$RemoteHost,
         [string]$PsExecPath,
-        [switch]$AutoReboot,
         [int]$SkipDays
     )
 
@@ -509,18 +483,53 @@ function Invoke-RemoteUpdate {
         }
     }
 
-    # Get local host name for UNC path
-    $localHost = $env:COMPUTERNAME
+    # Define remote paths
+    $remoteBasePath = "C:\Tools\WUP"
+    $remoteScriptName = "UpdateScriptv1.ps1"
+    $timestamp = Get-Date -Format 'yyyyMMddHHmmss'
+    $remoteLogName = "$RemoteHost-$timestamp.log"
+    
+    # Full paths (using literal paths to avoid any path resolution issues)
+    $remoteScriptPath = "C:\Tools\WUP\$remoteScriptName"
+    $remoteLogPath = "C:\Tools\WUP\$remoteLogName"
+    
+    # Create remote directory and copy script
+    try {
+        # Create remote directory using PsExec
+        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Creating remote directory on $RemoteHost..."
+        $createDirCmd = "cmd.exe /c if not exist $remoteBasePath mkdir $remoteBasePath"
+        $process = Start-Process -FilePath $PsExecPath -ArgumentList "\\$RemoteHost -s $createDirCmd" -NoNewWindow -Wait -PassThru
+        if ($process.ExitCode -ne 0) {
+            throw "Failed to create remote directory"
+        }
 
-    # Define paths
-    $remoteScriptPath = "\\$localHost\C$\Tools\Git\Win2Update\UpdateScriptv1.ps1"
-    $remoteLogPath = "%TEMP%\RemoteUpdate\$RemoteHost-$(Get-Date -Format 'yyyyMMddHHmmss').log"
+        # Copy script to remote host
+        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Copying update script to $RemoteHost..."
+        $sourcePath = Join-Path $PSScriptRoot $remoteScriptName
+        $destPath = "\\$RemoteHost\C$\Tools\WUP\$remoteScriptName"
+        Copy-Item -Path $sourcePath -Destination $destPath -Force
+    }
+    catch {
+        Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to prepare remote host: $_"
+        return [pscustomobject]@{
+            RemoteHost = $RemoteHost
+            ExitCode = 1
+            StdOut = ""
+            StdErr = "Failed to prepare remote host: $_"
+        }
+    }
 
     Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Executing update script on $RemoteHost..."
+    
+    # Debug output to show exact command
+    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Remote script path: $remoteScriptPath"
+    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Remote log path: $remoteLogPath"
 
     $processInfo = New-Object System.Diagnostics.ProcessStartInfo
     $processInfo.FileName = $PsExecPath
-    $processInfo.Arguments = "-nobanner -accepteula -h \\$RemoteHost powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$remoteScriptPath`" -LogPath `"$remoteLogPath`" -AutoReboot:$AutoReboot"
+    # Construct command line for remote execution with timeout and non-blocking
+    $processInfo.Arguments = "-nobanner -accepteula -n 10 -d -h \\$RemoteHost powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$remoteScriptPath`" -LogPath `"$remoteLogPath`""
+    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Full command: $($processInfo.FileName) $($processInfo.Arguments)"
     $processInfo.RedirectStandardOutput = $true
     $processInfo.RedirectStandardError = $true
     $processInfo.UseShellExecute = $false
@@ -548,8 +557,33 @@ function Invoke-RemoteUpdate {
 
         $stdOut = $stdOutTask.Result
         $stdErr = $stdErrTask.Result
-
+        
         Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] PsExec completed on $RemoteHost with ExitCode=$($process.ExitCode)"
+
+        # Copy log file from remote host if execution was successful
+        if ($process.ExitCode -eq 0) {
+            try {
+                # Create local logs directory if it doesn't exist
+                $localLogsDir = Join-Path $PSScriptRoot '.logs'
+                if (-not (Test-Path $localLogsDir)) {
+                    New-Item -ItemType Directory -Path $localLogsDir -Force | Out-Null
+                }
+
+                # Copy log file from remote host
+                $remoteLogUNC = "\\$RemoteHost\C$\Tools\WUP\$remoteLogName"
+                $localLogPath = Join-Path $localLogsDir $remoteLogName
+                
+                Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Retrieving log file from $RemoteHost..."
+                Copy-Item -Path $remoteLogUNC -Destination $localLogPath -Force
+                Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Log file copied to $localLogPath"
+                
+                # Optionally clean up remote log file
+                # Remove-Item -Path $remoteLogUNC -Force
+            }
+            catch {
+                Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to retrieve log file from $($RemoteHost): $_"
+            }
+        }
     } catch {
         Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Process execution error: $_"
         $stdOut = "Error: Process execution failed"
@@ -561,9 +595,6 @@ function Invoke-RemoteUpdate {
             StdErr     = $stdErr
         }
     }
-
-    # Optional: Retrieve remote log for debugging (if accessible)
-    # This could be added later if needed for better diagnostics
 
     return [pscustomobject]@{
         RemoteHost = $RemoteHost
@@ -596,14 +627,16 @@ if (-not $ErrorLogFile) {
 $errorLog = $ErrorLogFile
 $successLog = [System.IO.Path]::ChangeExtension($errorLog, '.success.log')
 
-# Initialize the log files if they don't exist
-if (-not (Test-Path -Path $errorLog)) {
-    New-Item -ItemType File -Path $errorLog -Force | Out-Null
-    Set-Content -Path $errorLog -Value "[]" -Force
-}
-if (-not (Test-Path -Path $successLog)) {
-    New-Item -ItemType File -Path $successLog -Force | Out-Null
-    Set-Content -Path $successLog -Value "[]" -Force
+if ($Log) {
+    # Initialize the log files if they don't exist
+    if (-not (Test-Path -Path $errorLog)) {
+        New-Item -ItemType File -Path $errorLog -Force | Out-Null
+        Set-Content -Path $errorLog -Value "[]" -Force
+    }
+    if (-not (Test-Path -Path $successLog)) {
+        New-Item -ItemType File -Path $successLog -Force | Out-Null
+        Set-Content -Path $successLog -Value "[]" -Force
+    }
 }
 
 # Set default paths for other files if not provided
@@ -621,6 +654,10 @@ if (-not $HostsFile) {
 if ($ForceRetry) {
     $hostQueue = Clear-RetryQueue -QueueFile $QueueFile
 }
+
+$successCount = 0
+$skipCount = 0
+$errorCount = 0
 
 # Load data
 $yamlData = Load-YamlData -File $YamlFile
@@ -677,7 +714,8 @@ foreach ($targetSystem in $targetMachines) {
         Update-HostData -YamlData $yamlData -Hostname $targetSystem -UpdateSuccess $false
         Save-YamlData -Data $yamlData -File $YamlFile
         $updateQueue[$targetSystem] = Get-Date
-        Write-StructuredLog -RemoteHost $targetSystem -Status 'Unreachable' -Message 'Host unreachable' -LogFile $errorLog
+        $errorCount++
+        if ($Log) { Write-StructuredLog -RemoteHost $targetSystem -Status 'Unreachable' -Message 'Host unreachable' -LogFile $errorLog }
         continue
     }
 
@@ -692,7 +730,8 @@ foreach ($targetSystem in $targetMachines) {
         Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Skipping $targetSystem (updated recently)."
         Update-HostData -YamlData $yamlData -Hostname $targetSystem -UpdateSuccess $true
         Save-YamlData -Data $yamlData -File $YamlFile
-        Write-StructuredLog -RemoteHost $targetSystem -Status 'Skipped' -Message 'Recently updated' -LogFile $successLog
+        $skipCount++
+        if ($Log) { Write-StructuredLog -RemoteHost $targetSystem -Status 'Skipped' -Message 'Recently updated' -LogFile $successLog }
         continue
     }
 
@@ -705,13 +744,15 @@ foreach ($targetSystem in $targetMachines) {
         Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] SUCCESS: $targetSystem update completed."
         $updateTimestamp = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ssZ')
         Update-HostData -YamlData $yamlData -Hostname $targetSystem -UpdateSuccess $true -UpdateTimestamp $updateTimestamp
-        Write-StructuredLog -RemoteHost $targetSystem -Status 'Success' -Message ($res.StdOut.Trim()) -LogFile $successLog
+        $successCount++
+        if ($Log) { Write-StructuredLog -RemoteHost $targetSystem -Status 'Success' -Message ($res.StdOut.Trim()) -LogFile $successLog }
     } else {
         Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ERROR: $targetSystem update failed."
         $msg = if ($res.StdErr) { $res.StdErr.Trim() } else { $res.StdOut.Trim() }
         Update-HostData -YamlData $yamlData -Hostname $targetSystem -UpdateSuccess $false
         $updateQueue[$targetSystem] = Get-Date
-        Write-StructuredLog -RemoteHost $targetSystem -Status 'Error' -Message $msg -LogFile $errorLog
+        $errorCount++
+        if ($Log) { Write-StructuredLog -RemoteHost $targetSystem -Status 'Error' -Message $msg -LogFile $errorLog }
     }
     Save-YamlData -Data $yamlData -File $YamlFile
 }
@@ -722,29 +763,6 @@ Save-HostQueue -Queue $hostQueue -File $QueueFile
 $timestamp = Get-StandardTimestamp
 Write-Host "`n=== Update Process Summary ($timestamp) ==="
 Write-Host "----------------------------------------"
-
-# Calculate statistics
-function Get-LogStatistics {
-    param([string]$LogFile, [string]$Status = $null)
-    
-    try {
-        if (Test-Path -Path $LogFile) {
-            $logs = Get-Content -Path $LogFile -Raw | ConvertFrom-Json
-            if ($Status) {
-                return @($logs | Where-Object Status -eq $Status).Count
-            }
-            return @($logs).Count
-        }
-    } catch {
-        $errorMsg = $_.Exception.Message
-        Write-Warning "Failed to read log statistics from ${LogFile}: $errorMsg"
-    }
-    return 0
-}
-
-$successCount = Get-LogStatistics -LogFile $successLog -Status 'Success'
-$skipCount = Get-LogStatistics -LogFile $successLog -Status 'Skipped'
-$errorCount = Get-LogStatistics -LogFile $errorLog
 
 $queuedCount = $hostQueue.Count
 
@@ -767,9 +785,9 @@ if ($queuedCount -gt 0) {
     }
 }
 
-Write-Host "`nLogs:"
-Write-Host "  Success Log: $successLog"
-Write-Host "  Error Log:   $errorLog"
-Write-Host "  Debug Logs:  $logsDir"
-
-Read-Host "`nPress Enter to exit"
+if ($Log) {
+    Write-Host "`nLogs:"
+    Write-Host "  Success Log: $successLog"
+    Write-Host "  Error Log:   $errorLog"
+    Write-Host "  Debug Logs:  $logsDir"
+}
