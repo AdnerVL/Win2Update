@@ -37,6 +37,7 @@ Before using this script, please be aware of these security considerations:
 - Internet connection
 - Administrator privileges
 - Windows Package Manager (`winget`)
+- PowerShell modules: `PSWindowsUpdate`, `powershell-yaml` (auto-installed if missing)
 - Secure storage location for scripts and logs
 - Properly configured file system permissions
 
@@ -66,6 +67,8 @@ Before using this script, please be aware of these security considerations:
 ## 📦 Components
 
 - `RemoteW2Update.ps1`: Main PowerShell script for remote, multi-host Windows and app updates. Handles queueing, error logging, and can retry unreachable hosts. Uses PsExec for all remote execution (no WinRM/PSRemoting required).
+- `RemoteW2Update_Improved.ps1`: Improved version of the remote script with enhanced error handling, optional parallelism for multiple hosts, structured JSON logging, and configurability (including winget hash verification).
+- `AdvancedRemoteUpdate.ps1`: Advanced remote update script with YAML-based tracking to skip hosts updated within a configurable period (default 5 days). Includes Windows Checks, winget upgrades, and firmware/driver updates via MSUpdate. Supports auto-reboot and detailed status tracking.
 - `UpdateScriptv1.ps1`: Standalone PowerShell script for local Windows and app updates, with logging, admin check, and optional auto-reboot.
 - `RunRemoteW2Update.bat`: Batch file to launch `RemoteW2Update.ps1` with correct PowerShell policy.
 - `RunUpdateScript.bat`: Batch file for launching `UpdateScriptv1.ps1` with elevation and debug logging.
@@ -108,6 +111,23 @@ Before using this script, please be aware of these security considerations:
    - Uses PsExec to run all update and upgrade steps on each remote host with full admin rights (no WinRM/PSRemoting required)
    - Logs errors to `errorLog.txt` and all update activity in `Logs/`
 
+### Advanced Remote (Multi-Host) Update with Tracking
+1. **Prepare `hosts.txt` or configuration:**
+   - List all target hostnames or IPs, one per line in `hosts.txt`
+   - Optional: Configure `hosts_tracking.yaml` for per-host settings (auto-created if missing)
+2. **Run as Administrator:**
+   - Right-click `RunAdvancedUpdate.bat` and select "Run as administrator"
+   - Or run from PowerShell (Admin):
+     ```powershell
+     & ".\RunAdvancedUpdate.bat"
+     ```
+3. **What it does:**
+   - Tracks update status in a YAML file to skip hosts updated within 5 days (configurable)
+   - Performs Windows Updates (including firmware/drivers via MSUpdate), winget upgrades, and optional auto-reboot
+   - Queues unreachable/failed hosts for retry (default 3 hours)
+   - Uses JSON-structured logging for successes and errors
+   - Requires Powershell-Yaml module (auto-installed if missing)
+
 ### Logging and Error Handling
 - Log files are created in the `Logs` directory for each run
 - Remote errors are logged in `errorLog.txt`
@@ -145,6 +165,7 @@ The script automatically configures:
 
 ## 📅 Update History
 
+- **October 1, 2025:** Added AdvancedRemoteUpdate.ps1 script and updated documentation.
 - **June 9, 2025:** Added logging and troubleshooting section.
 - **May 23, 2025:** Initial release.
 
@@ -170,4 +191,4 @@ This project is provided as-is, without warranty. Use at your own risk.
 Contributions are welcome! Please follow security guidelines when submitting PRs.
 
 ---
-Last updated: June 9, 2025
+Last updated: October 1, 2025

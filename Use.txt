@@ -98,7 +98,8 @@
 5. Ensure PsExec is not blocked by antivirus or endpoint protection.
 
 ### Update History
+- **October 1, 2025:** Updated documentation for new scripts.
 - **June 9, 2025:** Added logging and troubleshooting section.
 - **May 23, 2025:** Initial release.
 
-Last Updated: June 9, 2025
+Last Updated: October 1, 2025

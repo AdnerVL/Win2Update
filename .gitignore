@@ -1,7 +1,8 @@
 # Ignore all exe and txt files
 *.exe
 *.txt
-
+*.yaml
+.logs/
 # Optionally ignore log files in Logs folder
 Logs/*.txt
 Logs/*.winget
