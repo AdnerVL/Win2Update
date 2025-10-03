@@ -1,218 +1,117 @@
-<#
-    .SYNOPSIS
-        Advanced Remote Windows Update Script with YAML Tracking
-
-    .DESCRIPTION
-        Automates Windows Update, winget upgrades, and firmware (via MSUpdate) across remote hosts using PsExec. Tracks status in a YAML database to skip hosts updated within 5 days.
-
-        * YAML-based tracking (hosts_tracking.yaml) for hostname, last_connection_timestamp, last_successful_update_timestamp, update_success.
-        * Skips hosts if last successful update < 5 days ago.
-        * Online checks via Test-Connection; updates connection timestamp.
-        * Silent remote execution: Windows Updates, winget, firmware.*
-        * Retry queuing for failures/unreachable (default 3 hours).
-        * Optional auto-reboot.
-        * Structured JSON logging.
-        * Admin elevation required.
-
-    .PARAMETER HostsFile
-        Path to the file containing a list of target hosts (one per line). Defaults to "hosts.txt" in the script directory.
-
-    .PARAMETER YamlFile
-        Path to the YAML tracking database file. Defaults to "hosts_tracking.yaml" in the script directory.
-
-    .PARAMETER QueueFile
-        Path to the retry queue file. Defaults to "hostQueue.txt" in the script directory.
-
-    .PARAMETER ErrorLogFile
-        Path to the error log file. Successes are logged to a separate file with ".success.log" suffix.
-
-    .PARAMETER QueueDuration
-        Time in seconds before a host is retried after a failure. Defaults to 10,800 seconds (3 hours).
-
-    .PARAMETER PsExecPath
-        Path to PsExec.exe. Defaults to "PsExec.exe" in the script directory.
-
-    .PARAMETER DefaultReboot
-        When specified, remote hosts default to rebooting if updates require it (unless overridden by YAML per-host setting). Defaults to false (user manual reboot).
-
-    .PARAMETER SkipDays
-        Days to skip updates if last successful update was within this period. Defaults to 5.
-
-    .EXAMPLE
-        .\AdvancedRemoteUpdate.ps1 -HostsFile "hosts.txt" -AutoReboot -SkipDays 7
-
-        Processes hosts from hosts.txt, reboots if needed, skips if updated within 7 days.
-#>
-
+[CmdletBinding()]
 param(
-    [string]$HostsFile,
-    [string]$YamlFile,
-    [string]$QueueFile,
-    [string]$ErrorLogFile,
-    [ValidateRange(1, [int]::MaxValue)]
-    [int]$QueueDuration = 3 * 60 * 60,
-    [string]$PsExecPath,
-    [switch]$AutoReboot = $false,
+    [Parameter(Position=0)]
+    [string]$HostsFile = (Join-Path $PSScriptRoot 'hosts.txt'),
+    
+    [Parameter(Position=1)]
+    [string]$YamlFile = (Join-Path $PSScriptRoot 'hosts_tracking.yaml'),
+    
+    [Parameter(Position=2)]
+    [string]$QueueFile = (Join-Path $PSScriptRoot 'hostQueue.txt'),
+    
+    [Parameter(Position=3)]
     [ValidateRange(0, 365)]
     [int]$SkipDays = 5,
-    [switch]$ForceRetry = $false,
-    [switch]$SkipQueue = $false,
-    [switch]$Debug = $false,
-    [switch]$Log = $true
+    
+    [switch]$AutoReboot,
+    
+    [ValidateRange(0, 86400)]
+    [int]$QueueDuration = 10800
 )
 
-# Set error handling preferences
+#Requires -RunAsAdministrator
 $ErrorActionPreference = "Continue"
-$VerbosePreference = "Continue"
 
-# Initialize error codes
-$script:ERROR_CODES = @{
-    SUCCESS = 0
-    GENERAL_ERROR = 1
-    ADMIN_REQUIRED = 2
-    FILE_NOT_FOUND = 3
-    CONNECTION_ERROR = 4
-    UPDATE_FAILURE = 5
-    INVALID_CONFIG = 6
-}
+# ============================================
+# CORE FUNCTIONS
+# ============================================
 
-Write-Host "Script started."
-
-# Function to handle YAML data without requiring the PowerShell-Yaml module
-function ConvertFrom-Yaml {
-    param([string]$YamlContent)
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$RemoteHost = "",
+        [ValidateSet('Info', 'Warning', 'Error', 'Success')]
+        [string]$Level = 'Info'
+    )
     
-    $data = @{
-        systems = @()
+    $colors = @{
+        'Error' = 'Red'
+        'Warning' = 'Yellow'
+        'Success' = 'Green'
+        'Info' = 'White'
     }
     
-    # Simple YAML parsing for our specific needs
-    try {
-        $lines = $YamlContent -split "`n" | ForEach-Object { $_.Trim() }
-        $currentSystem = $null
-        
-        foreach ($line in $lines) {
-            if ($line -match '^-\s*hostname:\s*(.+)$') {
-                if ($currentSystem) {
-                    $data.systems += $currentSystem
-                }
+    $timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $logMessage = "[$timestamp] [$Level]"
+    if ($RemoteHost) { $logMessage += " [$RemoteHost]" }
+    $logMessage += " $Message"
+    
+    Write-Host $logMessage -ForegroundColor $colors[$Level]
+    
+    $logFile = Join-Path $PSScriptRoot ".logs\update_script.log"
+    $logMessage | Out-File -FilePath $logFile -Append -Encoding UTF8
+}
+
+# ============================================
+# YAML HANDLING
+# ============================================
+
+function ConvertFrom-SimpleYaml {
+    param([string]$Content)
+    
+    $data = @{ systems = @() }
+    if ([string]::IsNullOrWhiteSpace($Content)) { return $data }
+    
+    $currentSystem = $null
+    foreach ($line in ($Content -split '\r?\n' | Where-Object { $_ -match '\S' })) {
+        switch -Regex ($line) {
+            '^-\s*hostname:\s*(.+)$' {
+                if ($currentSystem) { $data.systems += $currentSystem }
                 $currentSystem = @{
-                    hostname = $matches[1]
+                    hostname = $matches[1].Trim()
                     last_connection_timestamp = $null
                     last_successful_update_timestamp = $null
                     update_success = $false
                 }
             }
-            elseif ($line -match '^(\s+)?(last_connection_timestamp):\s*(.+)$' -and $currentSystem) {
-                $currentSystem.last_connection_timestamp = $matches[3]
+            '^\s*(last_connection_timestamp|last_successful_update_timestamp):\s*(.+)$' {
+                if ($currentSystem) { $currentSystem[$matches[1]] = $matches[2].Trim() }
             }
-            elseif ($line -match '^(\s+)?(last_successful_update_timestamp):\s*(.+)$' -and $currentSystem) {
-                $currentSystem.last_successful_update_timestamp = $matches[3]
-            }
-            elseif ($line -match '^(\s+)?(update_success):\s*(true|false)$' -and $currentSystem) {
-                $currentSystem.update_success = $matches[3] -eq 'true'
+            '^\s*update_success:\s*(true|false)$' {
+                if ($currentSystem) { $currentSystem.update_success = $matches[1] -eq 'true' }
             }
         }
-        
-        if ($currentSystem) {
-            $data.systems += $currentSystem
-        }
     }
-    catch {
-        Write-Error "Error parsing YAML data: $_"
-        throw
-    }
-    
+    if ($currentSystem) { $data.systems += $currentSystem }
     return $data
 }
 
-function ConvertTo-Yaml {
-    param($Data)
+function ConvertTo-SimpleYaml {
+    param([hashtable]$Data)
     
     $yaml = "systems:`n"
     foreach ($system in $Data.systems) {
-        $yaml += "- hostname: $($system.hostname)`n"
-        $yaml += "  last_connection_timestamp: $($system.last_connection_timestamp)`n"
-        $yaml += "  last_successful_update_timestamp: $($system.last_successful_update_timestamp)`n"
-        $yaml += "  update_success: $($system.update_success.ToString().ToLower())`n"
+        $yaml += @"
+- hostname: $($system.hostname)
+  last_connection_timestamp: $($system.last_connection_timestamp ?? '')
+  last_successful_update_timestamp: $($system.last_successful_update_timestamp ?? '')
+  update_success: $($system.update_success.ToString().ToLower())
+"@
     }
-    
     return $yaml
 }
 
-# Enable debug output if requested
-if ($Debug) {
-    $DebugPreference = 'Continue'
-    Write-Host "=== Script Parameters ==="
-    Write-Host "HostsFile: $HostsFile"
-    Write-Host "YamlFile: $YamlFile"
-    Write-Host "QueueFile: $QueueFile"
-    Write-Host "ErrorLogFile: $ErrorLogFile"
-    Write-Host "QueueDuration: $QueueDuration"
-    Write-Host "PsExecPath: $PsExecPath"
-    Write-Host "AutoReboot: $AutoReboot"
-    Write-Host "SkipDays: $SkipDays"
-    Write-Host "ForceRetry: $ForceRetry"
-    Write-Host "SkipQueue: $SkipQueue"
-    Write-Host "======================="
-}
-
-# Set default file paths and ensure they exist
-$logsDir = Join-Path -Path $PSScriptRoot -ChildPath '.logs'
-if (-not (Test-Path -Path $logsDir)) { 
-    Write-Host "Creating logs directory: $logsDir"
-    New-Item -ItemType Directory -Path $logsDir -Force | Out-Null 
-}
-
-if (-not $HostsFile) { $HostsFile = Join-Path -Path $PSScriptRoot -ChildPath 'hosts.txt' }
-if (-not (Test-Path $HostsFile)) {
-    Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Hosts file not found: $HostsFile"
-    exit $ERROR_CODES.FILE_NOT_FOUND
-}
-
-if (-not $YamlFile) { $YamlFile = Join-Path -Path $PSScriptRoot -ChildPath 'hosts_tracking.yaml' }
-if (-not $QueueFile) { $QueueFile = Join-Path -Path $PSScriptRoot -ChildPath 'hostQueue.txt' }
-if (-not $ErrorLogFile) { $ErrorLogFile = Join-Path -Path $logsDir -ChildPath 'error.log' }
-
-# No need to initialize PowerShell-Yaml module anymore as we have our own YAML functions
-
-if (-not $PsExecPath) { 
-    $PsExecPath = Join-Path -Path $PSScriptRoot -ChildPath 'PsExec.exe'
-    if (-not (Test-Path $PsExecPath)) {
-        $PsExec64Path = Join-Path -Path $PSScriptRoot -ChildPath 'PsExec64.exe'
-        if (Test-Path $PsExec64Path) {
-            $PsExecPath = $PsExec64Path
-        } else {
-            Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Neither PsExec.exe nor PsExec64.exe found in script directory."
-            exit $ERROR_CODES.UPDATE_FAILURE
-        }
-    }
-}
-
-# YAML handling is now done with built-in functions
-
-# Helper functions
 function Load-YamlData {
     param([string]$File)
-    if (-not (Test-Path -Path $File)) {
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] YAML file not found. Creating empty $File."
-        $initialData = @{ systems = @() }
-        Save-YamlData -Data $initialData -File $File
-        return $initialData
+    
+    if (-not (Test-Path $File)) {
+        $data = @{ systems = @() }
+        Save-YamlData -Data $data -File $File
+        return $data
     }
-    try {
-        $content = Get-Content -Path $File -Raw
-        if ([string]::IsNullOrWhiteSpace($content)) {
-            return @{ systems = @() }
-        }
-        ConvertFrom-Yaml -YamlContent $content
-    } catch {
-        $errorMessage = $_.Exception.Message
-        Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Error loading YAML from ${File}: $errorMessage"
-        $fallback = @{ hosts = @() }
-        Save-YamlData -Data $fallback -File $File
-        return $fallback
-    }
+    
+    $content = Get-Content -Path $File -Raw -ErrorAction SilentlyContinue
+    return ConvertFrom-SimpleYaml -Content $content
 }
 
 function Save-YamlData {
@@ -220,115 +119,47 @@ function Save-YamlData {
         [hashtable]$Data,
         [string]$File
     )
-    try {
-        $yaml = ConvertTo-Yaml -Data $Data
-        $yaml | Set-Content -Path $File -Encoding UTF8 -Force
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Saved YAML data to $File."
-    } catch {
-        $errorMessage = $_.Exception.Message
-        Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to save YAML to ${File}: $errorMessage"
-    }
-}
-
-function Get-StandardTimestamp {
-    return (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-}
-
-function Write-StructuredLog {
-    param(
-        [string]$RemoteHost,
-        [string]$Status,
-        [string]$Message,
-        [string]$LogFile
-    )
     
-    # Validate parameters
-    if ([string]::IsNullOrEmpty($LogFile)) {
-        Write-Warning "No log file specified for structured logging"
-        return
-    }
-
-    try {
-        $entry = [PSCustomObject]@{
-            Timestamp  = Get-StandardTimestamp
-            RemoteHost = $RemoteHost
-            Status     = $Status
-            Message    = ($Message -replace "`r`n", " ").Trim() # Sanitize message
-        }
-        
-        # Ensure log file directory exists
-        $logDir = Split-Path -Parent $LogFile
-        if (-not (Test-Path -Path $logDir)) {
-            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-        }
-        
-        # Initialize or read existing logs
-        if (Test-Path $LogFile) {
-            try {
-                $content = Get-Content -Raw $LogFile
-                if ([string]::IsNullOrWhiteSpace($content)) {
-                    $logs = @()
-                } else {
-                    $logs = @(ConvertFrom-Json $content -ErrorAction Stop)
-                }
-            } catch {
-                Write-Warning "Error reading log file, reinitializing: $_"
-                $logs = @()
-            }
-        } else {
-            $logs = @()
-        }
-        
-        # Add new entry
-        $logs += $entry
-        
-        # Write back to file with error handling
-        try {
-            $logs | ConvertTo-Json -Depth 10 | Set-Content -Path $LogFile -Force -ErrorAction Stop
-        } catch {
-            Write-Warning "Failed to write to log file $LogFile : $_"
-            # Try to write to a backup location
-            $backupFile = Join-Path -Path $PSScriptRoot -ChildPath ".logs\backup_$(Get-Date -Format 'yyyyMMddHHmmss').log"
-            $logs | ConvertTo-Json -Depth 10 | Set-Content -Path $backupFile -Force
-        }
-    } catch {
-        Write-Warning "Error in structured logging: $_"
-    }
+    if (-not $Data) { return }
+    $yaml = ConvertTo-SimpleYaml -Data $Data
+    $yaml | Set-Content -Path $File -Encoding UTF8 -Force
 }
 
-function Load-HostQueue {
+# ============================================
+# QUEUE MANAGEMENT
+# ============================================
+
+function Get-HostQueue {
     param([string]$File)
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Loading host queue from $File."
-    $queue = @{}
-    if (-not (Test-Path -Path $File)) {
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Queue file not found. Creating empty $File."
-        New-Item -ItemType File -Path $File -Force | Out-Null
-        return $queue
-    } 
     
-    $content = Get-Content -Path $File -ErrorAction SilentlyContinue
-    if ($null -eq $content -or $content.Count -eq 0) {
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Queue file is empty."
-        return $queue
-    }
-
-    $content | ForEach-Object {
-        if (-not [string]::IsNullOrWhiteSpace($_)) {
-            $parts = $_ -split ','
-            if ($parts.Length -ge 2) {
-                $RemoteHost = $parts[0].Trim()
-                if (-not [string]::IsNullOrWhiteSpace($RemoteHost)) {
+    $queue = @{}
+    if (-not (Test-Path $File)) { return $queue }
+    
+    try {
+        Get-Content $File -ErrorAction Stop | ForEach-Object {
+            if ($_) {
+                $parts = $_ -split ','
+                if ($parts.Length -ge 2) {
+                    $hostname = $parts[0].Trim()
                     try {
-                        $timeStamp = [datetime]::Parse($parts[1])
-                        $queue[$RemoteHost] = $timeStamp
+                        $queue[$hostname] = [datetime]::Parse($parts[1])
                     } catch {
-                        Write-Warning ("[{0}] Invalid timestamp for host '{1}': '{2}'" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $RemoteHost, $parts[1])
+                        Write-Log -Level Warning -Message "Invalid timestamp for $hostname"
                     }
                 }
             }
         }
+    } catch {
+        Write-Log -Level Warning -Message "Error reading queue file: $_"
     }
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Host queue loaded with $($queue.Count) entries."
+    
+    # Clean expired entries safely
+    $now = Get-Date
+    $keysToRemove = $queue.Keys | Where-Object { 
+        ($now - $queue[$_]).TotalSeconds -gt $QueueDuration 
+    }
+    foreach ($k in $keysToRemove) { $queue.Remove($k) }
+    
     return $queue
 }
 
@@ -337,104 +168,73 @@ function Save-HostQueue {
         [hashtable]$Queue,
         [string]$File
     )
+    
     if ($null -eq $Queue) { return }
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Saving host queue to $File."
-    $lines = $Queue.GetEnumerator() | ForEach-Object { "{0},{1}" -f $_.Key, $_.Value.ToString('o') }
-    $lines | Out-File -FilePath $File -Force -Encoding utf8
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Host queue saved."
+    
+    $lines = $Queue.GetEnumerator() | 
+        Where-Object { $_.Value } | 
+        ForEach-Object { "$($_.Key),$($_.Value.ToString('o'))" }
+    
+    if ($lines) {
+        $lines | Out-File -FilePath $File -Force -Encoding utf8
+    } else {
+        Clear-Content -Path $File -ErrorAction SilentlyContinue
+    }
 }
+
+# ============================================
+# HOST MANAGEMENT
+# ============================================
 
 function Get-TargetHosts {
     param([string]$File)
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Getting target hosts from $File."
-    if (-not (Test-Path -Path $File)) {
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Hosts file not found. Creating empty $File."
-        New-Item -ItemType File -Path $File -Force | Out-Null
+    
+    if (-not (Test-Path $File)) {
+        Write-Log -Level Warning -Message "Hosts file not found: $File"
         return @()
     }
     
-    $content = Get-Content -Path $File -ErrorAction SilentlyContinue
-    if ($null -eq $content) {
-        Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to read $File or file is empty."
-        return @()
-    }
+    $hosts = Get-Content $File -ErrorAction SilentlyContinue | 
+        Where-Object { $_ -and $_ -match '^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$' } |
+        ForEach-Object { $_.Trim() }
     
-    $validHosts = $content | 
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-        ForEach-Object { $_.Trim() } |
-        Where-Object { $_ -match '^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$' }
-    
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Found $($validHosts.Count) valid hosts in $File."
-    if ($validHosts.Count -eq 0) {
-        Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] No valid hosts found in $File. Add valid hostnames and rerun."
-    }
-    return $validHosts
+    Write-Log -Message "Found $($hosts.Count) valid hosts"
+    return $hosts
 }
 
 function Should-ProcessHost {
     param(
         [string]$RemoteHost,
-        [hashtable]$Queue,
-        [int]$QueueDuration
+        [hashtable]$Queue
     )
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Checking if $RemoteHost should be processed."
     
-    # Always ensure we have a valid queue hashtable
-    if ($null -eq $Queue) {
-        $Queue = @{}
-    }
-    
-    # If SkipQueue or ForceRetry is enabled, always process
-    if ($SkipQueue -or $ForceRetry) {
-        $reason = if ($SkipQueue) { "Skip queue" } else { "Force retry" }
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $reason enabled for $RemoteHost."
-        if ($Queue.ContainsKey($RemoteHost)) {
-            $Queue.Remove($RemoteHost)
-        }
+    if (-not $Queue -or -not $Queue.ContainsKey($RemoteHost)) {
         return $true
     }
-
-    if ($Queue.ContainsKey($RemoteHost)) {
-        $queuedTime = $Queue[$RemoteHost]
-        $elapsed = ((Get-Date) - $queuedTime).TotalSeconds
+    
+    $elapsed = ((Get-Date) - $Queue[$RemoteHost]).TotalSeconds
+    if ($elapsed -lt $QueueDuration) {
         $remainingMinutes = [math]::Round(($QueueDuration - $elapsed) / 60)
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $RemoteHost is in queue. Elapsed time: $elapsed seconds (Remaining: $remainingMinutes minutes)."
-        
-        if ($elapsed -lt $QueueDuration) {
-            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Skipping $RemoteHost (retry in $remainingMinutes minutes)."
-            return $false
-        } else {
-            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Removing $RemoteHost from queue (retry duration met)."
-            $Queue.Remove($RemoteHost)
-            return $true
-        }
+        Write-Log -Message "Skipping $RemoteHost (retry in $remainingMinutes minutes)"
+        return $false
     }
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $RemoteHost is not in queue. Proceeding."
+    
+    $Queue.Remove($RemoteHost)
     return $true
-}
-
-function Test-HostConnectivity {
-    param([string]$RemoteHost)
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Testing connectivity to $RemoteHost."
-    $result = Test-Connection -ComputerName $RemoteHost -Count 1 -Quiet
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Connectivity test result for ${RemoteHost}: ${result}"
-    return $result
 }
 
 function Should-SkipUpdate {
     param(
         [object]$HostData,
-        [int]$SkipDays
+        [int]$Days
     )
-    if ($null -eq $HostData.last_successful_update_timestamp -or $HostData.last_successful_update_timestamp -eq '') {
-        return $false
-    }
+    
+    if (-not $HostData.last_successful_update_timestamp) { return $false }
+    
     try {
         $lastUpdate = [datetime]::Parse($HostData.last_successful_update_timestamp)
-        $age = (Get-Date) - $lastUpdate
-        return $age.TotalDays -lt $SkipDays
+        return ((Get-Date) - $lastUpdate).TotalDays -lt $Days
     } catch {
-        Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Error parsing timestamp for $($HostData.hostname): $_"
         return $false
     }
 }
@@ -443,18 +243,19 @@ function Update-HostData {
     param(
         [hashtable]$YamlData,
         [string]$Hostname,
-        [boolean]$UpdateSuccess,
+        [bool]$UpdateSuccess,
         [string]$UpdateTimestamp = $null,
         [string]$ConnectionTimestamp = $null
     )
+    
     $hostEntry = $YamlData.systems | Where-Object { $_.hostname -eq $Hostname }
+    
     if (-not $hostEntry) {
         $hostEntry = @{
-            hostname                      = $Hostname
-            last_connection_timestamp    = $ConnectionTimestamp
+            hostname = $Hostname
+            last_connection_timestamp = $ConnectionTimestamp
             last_successful_update_timestamp = $UpdateTimestamp
-            update_success                = $UpdateSuccess
-            reboot                        = $false
+            update_success = $UpdateSuccess
         }
         $YamlData.systems += $hostEntry
     } else {
@@ -464,330 +265,269 @@ function Update-HostData {
     }
 }
 
+# ============================================
+# REMOTE UPDATE EXECUTION
+# ============================================
+
 function Invoke-RemoteUpdate {
     param(
         [string]$RemoteHost,
-        [string]$PsExecPath,
-        [int]$SkipDays
+        [string]$PsExecPath
     )
-
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Starting remote update on $RemoteHost."
-
-    if ([string]::IsNullOrEmpty($RemoteHost)) {
-        Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Remote host name is empty"
-        return [pscustomobject]@{
-            RemoteHost = $RemoteHost
-            ExitCode = 1
-            StdOut = "Error: Remote host name is empty"
-            StdErr = "Invalid remote host parameter"
-        }
-    }
-
-    # Define remote paths
-    $remoteBasePath = "C:\Tools\WUP"
-    $remoteScriptName = "UpdateScriptv1.ps1"
-    $timestamp = Get-Date -Format 'yyyyMMddHHmmss'
-    $remoteLogName = "$RemoteHost-$timestamp.log"
     
-    # Full paths (using literal paths to avoid any path resolution issues)
-    $remoteScriptPath = "C:\Tools\WUP\$remoteScriptName"
-    $remoteLogPath = "C:\Tools\WUP\$remoteLogName"
+    Write-Log -Message "Starting update" -RemoteHost $RemoteHost -Level Info
     
-    # Create remote directory and copy script
     try {
-        # Create remote directory using PsExec
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Creating remote directory on $RemoteHost..."
-        $createDirCmd = "cmd.exe /c if not exist $remoteBasePath mkdir $remoteBasePath"
-        $process = Start-Process -FilePath $PsExecPath -ArgumentList "\\$RemoteHost -s $createDirCmd" -NoNewWindow -Wait -PassThru
-        if ($process.ExitCode -ne 0) {
-            throw "Failed to create remote directory"
+        # Verify SMB connectivity (port 445) for PsExec
+        if (-not (Test-NetConnection -ComputerName $RemoteHost -Port 445 -InformationLevel Quiet)) {
+            throw "Cannot connect to SMB port 445 (required for PsExec)"
         }
-
-        # Copy script to remote host
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Copying update script to $RemoteHost..."
-        $sourcePath = Join-Path $PSScriptRoot $remoteScriptName
-        $destPath = "\\$RemoteHost\C$\Tools\WUP\$remoteScriptName"
-        Copy-Item -Path $sourcePath -Destination $destPath -Force
+        
+        # PowerShell command to execute updates
+        $psCommand = @'
+$log = @(); $needsReboot = $false;
+try {
+    $log += "Starting update session at $(Get-Date -Format 'o')";
+    if (-not (Get-Service -Name wuauserv -ErrorAction SilentlyContinue)) {
+        $log += "Windows Update service not found"; exit 1
     }
-    catch {
-        Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to prepare remote host: $_"
-        return [pscustomobject]@{
-            RemoteHost = $RemoteHost
+    $log += "Windows Update service found.";
+    $updateSession = New-Object -ComObject Microsoft.Update.Session;
+    $log += "Update session created.";
+    $updateSearcher = $updateSession.CreateUpdateSearcher();
+    $log += "Update searcher created.";
+    $log += "Searching for updates...";
+    $searchResult = $updateSearcher.Search('IsInstalled=0');
+    $log += "Search completed. Found $($searchResult.Updates.Count) updates.";
+    if ($searchResult.Updates.Count -eq 0) { $log += 'No updates available.'; $log | Out-String; exit 0 }
+    $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl;
+    foreach ($update in $searchResult.Updates) {
+        $log += "Processing update: $($update.Title) (KB$($update.KBArticleIDs -join ','))";
+        if ($update.IsDownloaded -or $update.AutoSelectOnWebSites) {
+            $updatesToInstall.Add($update) | Out-Null;
+            $log += "Selected for install: $($update.Title)";
+        } else {
+            $log += "Skipped (not downloaded or auto-select): $($update.Title)";
+        }
+    }
+    if ($updatesToInstall.Count -eq 0) { $log += 'No installable updates.'; $log | Out-String; exit 0 }
+    $downloader = $updateSession.CreateUpdateDownloader();
+    $downloader.Updates = $updatesToInstall;
+    $log += "Starting download of $($updatesToInstall.Count) updates...";
+    $downloadResult = $downloader.Download();
+    $log += "Download completed. Result code: $($downloadResult.ResultCode) HResult: $($downloadResult.HResult)";
+    if ($downloadResult.ResultCode -ne 2) { throw "Download failed with code $($downloadResult.ResultCode)" }
+    $installer = $updateSession.CreateUpdateInstaller();
+    $installer.Updates = $updatesToInstall;
+    $log += "Starting installation...";
+    $installResult = $installer.Install();
+    $log += "Installation completed. Result code: $($installResult.ResultCode) HResult: $($installResult.HResult)";
+    $needsReboot = $installResult.RebootRequired;
+    if ($needsReboot) { $log += 'Reboot required.' }
+    $log | Out-String;
+    if ($installResult.ResultCode -eq 2) { exit 0 } else { exit 1 }
+} catch {
+    $log += "Exception: $($_.Exception.GetType().FullName) - $($_.Exception.Message)";
+    $log += "StackTrace: $($_.Exception.StackTrace)";
+    $log | Out-String; exit 1
+} finally {
+    $log += "Update session ended at $(Get-Date -Format 'o')";
+    $log | Out-String
+}
+'@
+
+        # Base64-encode the command to avoid escaping issues
+        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($psCommand))
+
+        # PsExec arguments
+        $args = @(
+            "-nobanner",
+            "-accepteula",
+            "-s",
+            "-h",
+            "\\$RemoteHost",
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy Bypass",
+            "-EncodedCommand",
+            $encodedCommand
+        )
+        
+        $psi = [System.Diagnostics.ProcessStartInfo]@{
+            FileName = $PsExecPath
+            Arguments = $args -join ' '
+            RedirectStandardOutput = $true
+            RedirectStandardError = $true
+            UseShellExecute = $false
+            CreateNoWindow = $true
+        }
+        
+        $process = [System.Diagnostics.Process]::Start($psi)
+        $timeout = 900000 # 15 minutes in milliseconds
+        
+        if (-not $process.WaitForExit($timeout)) {
+            $process.Kill()
+            throw "Update timed out after 15 minutes"
+        }
+        
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+        
+        # Log output
+        if ($stdout) {
+            $stdout -split "`n" | ForEach-Object { if ($_) { Write-Log -Level Info -RemoteHost $RemoteHost -Message $_ } }
+        }
+        if ($stderr) {
+            Write-Log -Level Error -RemoteHost $RemoteHost -Message $stderr
+        }
+        
+        return @{
+            ExitCode = $process.ExitCode
+            StdOut = $stdout
+            StdErr = $stderr
+        }
+        
+    } catch {
+        Write-Log -Level Error -RemoteHost $RemoteHost -Message $_
+        return @{
             ExitCode = 1
             StdOut = ""
-            StdErr = "Failed to prepare remote host: $_"
+            StdErr = $_.Exception.Message
         }
     }
+}
 
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Executing update script on $RemoteHost..."
+# ============================================
+# INITIALIZATION
+# ============================================
+
+function Initialize-Environment {
+    # Find PsExec
+    $script:PsExecPath = Get-ChildItem -Path $PSScriptRoot -Filter "PsExec*.exe" | 
+        Select-Object -First 1 -ExpandProperty FullName
     
-    # Debug output to show exact command
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Remote script path: $remoteScriptPath"
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Remote log path: $remoteLogPath"
+    if (-not $PsExecPath) {
+        throw "PsExec.exe not found in script directory"
+    }
+    
+    # Create required directories
+    $logsDir = Join-Path $PSScriptRoot ".logs"
+    if (-not (Test-Path $logsDir)) {
+        New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
+    }
+    
+    Write-Log -Message "Environment initialized" -Level Info
+}
 
-    $processInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $processInfo.FileName = $PsExecPath
-    # Construct command line for remote execution with timeout and non-blocking
-    $processInfo.Arguments = "-nobanner -accepteula -n 10 -d -h \\$RemoteHost powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$remoteScriptPath`" -LogPath `"$remoteLogPath`""
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Full command: $($processInfo.FileName) $($processInfo.Arguments)"
-    $processInfo.RedirectStandardOutput = $true
-    $processInfo.RedirectStandardError = $true
-    $processInfo.UseShellExecute = $false
+# ============================================
+# MAIN EXECUTION
+# ============================================
 
-    try {
-        $process = [System.Diagnostics.Process]::Start($processInfo)
-        if (-not $process) {
-            throw "Failed to start PsExec process for execution"
-        }
+Write-Host "`nWindows Update Automation Script" -ForegroundColor Cyan
+Write-Host ("=" * 40) -ForegroundColor Cyan
 
-        # Read output streams asynchronously to prevent deadlocks
-        $stdOutTask = $process.StandardOutput.ReadToEndAsync()
-        $stdErrTask = $process.StandardError.ReadToEndAsync()
-
-        # Reduced timeout to 15 minutes for quicker failure detection
-        if (-not $process.WaitForExit(900000)) { # 15 minute timeout
-            Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Process timeout for $RemoteHost after 15 minutes, attempting to terminate..."
-            try {
-                $process.Kill()
-            } catch {
-                Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to terminate process: $_"
-            }
-            throw "Process timed out after 15 minutes"
-        }
-
-        $stdOut = $stdOutTask.Result
-        $stdErr = $stdErrTask.Result
+try {
+    # Initialize
+    Initialize-Environment
+    
+    # Load data
+    $yamlData = Load-YamlData -File $YamlFile
+    $hostQueue = Get-HostQueue -File $QueueFile
+    $targetHosts = Get-TargetHosts -File $HostsFile
+    
+    if (-not $targetHosts) {
+        Write-Log -Level Error -Message "No valid hosts found"
+        exit 1
+    }
+    
+    # Statistics
+    $stats = @{
+        Success = 0
+        Skipped = 0
+        Failed = 0
+        Unreachable = 0
+    }
+    
+    Write-Log -Message "Processing $($targetHosts.Count) hosts" -Level Info
+    
+    # Process each host
+    foreach ($computerName in $targetHosts) {
+        Write-Host "`n$('=' * 40)" -ForegroundColor Gray
+        Write-Log -Message "Processing host" -RemoteHost $computerName -Level Info
         
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] PsExec completed on $RemoteHost with ExitCode=$($process.ExitCode)"
-
-        # Copy log file from remote host if execution was successful
-        if ($process.ExitCode -eq 0) {
-            try {
-                # Create local logs directory if it doesn't exist
-                $localLogsDir = Join-Path $PSScriptRoot '.logs'
-                if (-not (Test-Path $localLogsDir)) {
-                    New-Item -ItemType Directory -Path $localLogsDir -Force | Out-Null
-                }
-
-                # Copy log file from remote host
-                $remoteLogUNC = "\\$RemoteHost\C$\Tools\WUP\$remoteLogName"
-                $localLogPath = Join-Path $localLogsDir $remoteLogName
-                
-                Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Retrieving log file from $RemoteHost..."
-                Copy-Item -Path $remoteLogUNC -Destination $localLogPath -Force
-                Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Log file copied to $localLogPath"
-                
-                # Optionally clean up remote log file
-                # Remove-Item -Path $remoteLogUNC -Force
-            }
-            catch {
-                Write-Warning "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Failed to retrieve log file from $($RemoteHost): $_"
-            }
+        # Check queue
+        if (-not (Should-ProcessHost -RemoteHost $computerName -Queue $hostQueue)) {
+            $stats.Skipped++
+            continue
         }
-    } catch {
-        Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Process execution error: $_"
-        $stdOut = "Error: Process execution failed"
-        $stdErr = $_.Exception.Message
-        return [pscustomobject]@{
-            RemoteHost = $RemoteHost
-            ExitCode   = 1
-            StdOut     = $stdOut
-            StdErr     = $stdErr
+        
+        # Test connectivity
+        if (-not (Test-Connection -ComputerName $computerName -Count 1 -Quiet)) {
+            Write-Log -Level Warning -RemoteHost $computerName -Message "Host unreachable"
+            $hostQueue[$computerName] = Get-Date
+            $stats.Unreachable++
+            Update-HostData -YamlData $yamlData -Hostname $computerName -UpdateSuccess $false
+            continue
         }
-    }
-
-    return [pscustomobject]@{
-        RemoteHost = $RemoteHost
-        ExitCode   = $process.ExitCode
-        StdOut     = $StdOut
-        StdErr     = $StdErr
-    }
-}
-
-# Function to clear retry queue
-function Clear-RetryQueue {
-    param([string]$QueueFile)
-    if (Test-Path $QueueFile) {
-        Remove-Item $QueueFile -Force
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Cleared retry queue."
-    }
-    return @{}
-}
-
-# Initialize log paths and ensure directories exist
-$logsDir = Join-Path -Path $PSScriptRoot -ChildPath '.logs'
-if (-not (Test-Path -Path $logsDir)) {
-    New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
-}
-
-# Set default file paths if not provided
-if (-not $ErrorLogFile) {
-    $ErrorLogFile = Join-Path -Path $logsDir -ChildPath 'error.log'
-}
-$errorLog = $ErrorLogFile
-$successLog = [System.IO.Path]::ChangeExtension($errorLog, '.success.log')
-
-if ($Log) {
-    # Initialize the log files if they don't exist
-    if (-not (Test-Path -Path $errorLog)) {
-        New-Item -ItemType File -Path $errorLog -Force | Out-Null
-        Set-Content -Path $errorLog -Value "[]" -Force
-    }
-    if (-not (Test-Path -Path $successLog)) {
-        New-Item -ItemType File -Path $successLog -Force | Out-Null
-        Set-Content -Path $successLog -Value "[]" -Force
-    }
-}
-
-# Set default paths for other files if not provided
-if (-not $YamlFile) { 
-    $YamlFile = Join-Path -Path $PSScriptRoot -ChildPath 'hosts_tracking.yaml'
-}
-if (-not $QueueFile) { 
-    $QueueFile = Join-Path -Path $PSScriptRoot -ChildPath 'hostQueue.txt'
-}
-if (-not $HostsFile) { 
-    $HostsFile = Join-Path -Path $PSScriptRoot -ChildPath 'hosts.txt'
-}
-
-# Clear retry queue if force retry is enabled
-if ($ForceRetry) {
-    $hostQueue = Clear-RetryQueue -QueueFile $QueueFile
-}
-
-$successCount = 0
-$skipCount = 0
-$errorCount = 0
-
-# Load data
-$yamlData = Load-YamlData -File $YamlFile
-$updateQueue = Load-HostQueue -File $QueueFile
-$targetMachines = Get-TargetHosts -File $HostsFile
-if (-not $targetMachines -or $targetMachines.Count -eq 0) {
-    Write-Error "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] No hosts provided. Exiting."
-    return
-}
-
-# Initialize YAML if empty
-if ($yamlData.systems.Count -eq 0) {
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Initializing YAML with host list."
-    foreach ($machine in $targetMachines) {
-        Update-HostData -YamlData $yamlData -Hostname $machine -UpdateSuccess $false -ConnectionTimestamp $null -UpdateTimestamp $null
-    }
-    Save-YamlData -Data $yamlData -File $YamlFile
-}
-
-Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Starting update process for $($targetMachines.Count) host(s)..."
-
-if ($Debug) {
-    Write-Host "[DEBUG] Queue status:"
-    Write-Host "[DEBUG] SkipQueue: $SkipQueue"
-    Write-Host "[DEBUG] ForceRetry: $ForceRetry"
-    Write-Host "[DEBUG] Current queue entries: $($updateQueue.Count)"
-    if ($updateQueue -and $updateQueue.Count -gt 0) {
-        $updateQueue.Keys | ForEach-Object { 
-            Write-Host "[DEBUG] - $_ : $($updateQueue[$_])"
+        
+        # Update connection timestamp
+        $timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        Update-HostData -YamlData $yamlData -Hostname $computerName -UpdateSuccess $false -ConnectionTimestamp $timestamp
+        
+        # Check if recently updated
+        $hostData = $yamlData.systems | Where-Object { $_.hostname -eq $computerName }
+        if (Should-SkipUpdate -HostData $hostData -Days $SkipDays) {
+            Write-Log -Level Info -RemoteHost $computerName -Message "Recently updated, skipping"
+            $stats.Skipped++
+            continue
         }
-    }
-}
-
-foreach ($targetSystem in $targetMachines) {
-    Write-Host "`n[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Processing host: $targetSystem"
-    Write-Host "=================================================="
-
-    if ($Debug) {
-        Write-Host "[DEBUG] Checking host processing conditions:"
-        Write-Host "[DEBUG] - In Queue: $($updateQueue.ContainsKey($targetSystem))"
-        Write-Host "[DEBUG] - SkipQueue: $SkipQueue"
-        Write-Host "[DEBUG] - ForceRetry: $ForceRetry"
-    }
-
-    # Queue check
-    if (-not (Should-ProcessHost -RemoteHost $targetSystem -Queue $updateQueue -QueueDuration $QueueDuration)) {
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Skipping $targetSystem (in retry queue)."
-        continue
-    }
-
-    # Connectivity
-    if (-not (Test-HostConnectivity -RemoteHost $targetSystem)) {
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Unreachable: $targetSystem (queued for retry)."
-        Update-HostData -YamlData $yamlData -Hostname $targetSystem -UpdateSuccess $false
+        
+        # Perform update
+        $result = Invoke-RemoteUpdate -RemoteHost $computerName -PsExecPath $PsExecPath
+        
+        if ($result.ExitCode -eq 0) {
+            Write-Log -Level Success -RemoteHost $computerName -Message "Update completed successfully"
+            $updateTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            Update-HostData -YamlData $yamlData -Hostname $computerName -UpdateSuccess $true -UpdateTimestamp $updateTime
+            $stats.Success++
+        } else {
+            Write-Log -Level Error -RemoteHost $computerName -Message "Update failed"
+            Update-HostData -YamlData $yamlData -Hostname $computerName -UpdateSuccess $false
+            $hostQueue[$computerName] = Get-Date
+            $stats.Failed++
+        }
+        
+        # Save progress
         Save-YamlData -Data $yamlData -File $YamlFile
-        $updateQueue[$targetSystem] = Get-Date
-        $errorCount++
-        if ($Log) { Write-StructuredLog -RemoteHost $targetSystem -Status 'Unreachable' -Message 'Host unreachable' -LogFile $errorLog }
-        continue
     }
-
-    # Update connection
-    $connectionTimestamp = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ssZ')
-    Update-HostData -YamlData $yamlData -Hostname $targetSystem -UpdateSuccess $false -ConnectionTimestamp $connectionTimestamp
-    Save-YamlData -Data $yamlData -File $YamlFile
-
-    # Check host data for skip
-    $systemData = $yamlData.systems | Where-Object { $_.hostname -eq $targetSystem }
-    if (Should-SkipUpdate -HostData $systemData -SkipDays $SkipDays) {
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Skipping $targetSystem (updated recently)."
-        Update-HostData -YamlData $yamlData -Hostname $targetSystem -UpdateSuccess $true
-        Save-YamlData -Data $yamlData -File $YamlFile
-        $skipCount++
-        if ($Log) { Write-StructuredLog -RemoteHost $targetSystem -Status 'Skipped' -Message 'Recently updated' -LogFile $successLog }
-        continue
-    }
-
-    # Determine reboot flag
-    $rebootFlag = $systemData.reboot -as [boolean]
-
-    # Perform update
-    $res = Invoke-RemoteUpdate -RemoteHost $targetSystem -PsExecPath $PsExecPath -AutoReboot:$AutoReboot -SkipDays $SkipDays
-    if ($res.ExitCode -eq 0) {
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] SUCCESS: $targetSystem update completed."
-        $updateTimestamp = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ssZ')
-        Update-HostData -YamlData $yamlData -Hostname $targetSystem -UpdateSuccess $true -UpdateTimestamp $updateTimestamp
-        $successCount++
-        if ($Log) { Write-StructuredLog -RemoteHost $targetSystem -Status 'Success' -Message ($res.StdOut.Trim()) -LogFile $successLog }
-    } else {
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ERROR: $targetSystem update failed."
-        $msg = if ($res.StdErr) { $res.StdErr.Trim() } else { $res.StdOut.Trim() }
-        Update-HostData -YamlData $yamlData -Hostname $targetSystem -UpdateSuccess $false
-        $updateQueue[$targetSystem] = Get-Date
-        $errorCount++
-        if ($Log) { Write-StructuredLog -RemoteHost $targetSystem -Status 'Error' -Message $msg -LogFile $errorLog }
-    }
-    Save-YamlData -Data $yamlData -File $YamlFile
-}
-
-Save-HostQueue -Queue $hostQueue -File $QueueFile
-
-# Generate detailed summary
-$timestamp = Get-StandardTimestamp
-Write-Host "`n=== Update Process Summary ($timestamp) ==="
-Write-Host "----------------------------------------"
-
-$queuedCount = $hostQueue.Count
-
-# Display summary
-Write-Host "Total Hosts Processed: $($targetMachines.Count)"
-Write-Host "Successful Updates:    $successCount"
-Write-Host "Skipped (Recent):      $skipCount"
-Write-Host "Failed/Unreachable:    $errorCount"
-Write-Host "Queued for Retry:      $queuedCount"
-Write-Host "----------------------------------------"
-
-# Display retry queue if not empty
-if ($queuedCount -gt 0) {
-    Write-Host "`nHosts in retry queue:"
-    $hostQueue.GetEnumerator() | ForEach-Object {
-        $waitTime = [math]::Round(($QueueDuration - ((Get-Date) - $_.Value).TotalSeconds))
-        if ($waitTime -gt 0) {
-            Write-Host "  $($_.Key) - Retry in $([math]::Round($waitTime/60)) minutes"
+    
+    # Save final state
+    Save-HostQueue -Queue $hostQueue -File $QueueFile
+    
+    # Display summary
+    Write-Host "`n$('=' * 40)" -ForegroundColor Cyan
+    Write-Host "EXECUTION SUMMARY" -ForegroundColor Cyan
+    Write-Host "$('=' * 40)" -ForegroundColor Cyan
+    Write-Host "Total Hosts:    $($targetHosts.Count)"
+    Write-Host "Successful:     $($stats.Success)" -ForegroundColor Green
+    Write-Host "Skipped:        $($stats.Skipped)" -ForegroundColor Yellow
+    Write-Host "Failed:         $($stats.Failed)" -ForegroundColor Red
+    Write-Host "Unreachable:    $($stats.Unreachable)" -ForegroundColor Red
+    Write-Host "Queued:         $($hostQueue.Count)" -ForegroundColor Yellow
+    
+    if ($hostQueue.Count -gt 0) {
+        Write-Host "`nHosts in retry queue:" -ForegroundColor Yellow
+        $hostQueue.GetEnumerator() | ForEach-Object {
+            $wait = [math]::Round(($QueueDuration - ((Get-Date) - $_.Value).TotalSeconds) / 60)
+            if ($wait -gt 0) {
+                Write-Host "  $($_.Key) - retry in $wait minutes"
+            }
         }
     }
-}
-
-if ($Log) {
-    Write-Host "`nLogs:"
-    Write-Host "  Success Log: $successLog"
-    Write-Host "  Error Log:   $errorLog"
-    Write-Host "  Debug Logs:  $logsDir"
+    
+} catch {
+    Write-Log -Level Error -Message "Script error: $_"
+    exit 1
+} finally {
+    Write-Host "`nScript completed" -ForegroundColor Green
 }
