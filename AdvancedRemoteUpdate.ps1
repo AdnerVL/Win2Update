@@ -300,23 +300,22 @@ try {
     $searchResult = $updateSearcher.Search('IsInstalled=0');
     $log += "Search completed. Found $($searchResult.Updates.Count) updates.";
     if ($searchResult.Updates.Count -eq 0) { $log += 'No updates available.'; $log | Out-String; exit 0 }
-    $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl;
+    $updatesToDownload = New-Object -ComObject Microsoft.Update.UpdateColl;
     foreach ($update in $searchResult.Updates) {
         $log += "Processing update: $($update.Title) (KB$($update.KBArticleIDs -join ','))";
-        if ($update.IsDownloaded -or $update.AutoSelectOnWebSites) {
-            $updatesToInstall.Add($update) | Out-Null;
-            $log += "Selected for install: $($update.Title)";
-        } else {
-            $log += "Skipped (not downloaded or auto-select): $($update.Title)";
-        }
+        $updatesToDownload.Add($update) | Out-Null;
+        $log += "Queued for download and install: $($update.Title)";
     }
-    if ($updatesToInstall.Count -eq 0) { $log += 'No installable updates.'; $log | Out-String; exit 0 }
     $downloader = $updateSession.CreateUpdateDownloader();
-    $downloader.Updates = $updatesToInstall;
-    $log += "Starting download of $($updatesToInstall.Count) updates...";
+    $downloader.Updates = $updatesToDownload;
+    $log += "Starting download of $($updatesToDownload.Count) updates...";
     $downloadResult = $downloader.Download();
     $log += "Download completed. Result code: $($downloadResult.ResultCode) HResult: $($downloadResult.HResult)";
     if ($downloadResult.ResultCode -ne 2) { throw "Download failed with code $($downloadResult.ResultCode)" }
+    $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl;
+    foreach ($update in $searchResult.Updates) {
+        $updatesToInstall.Add($update) | Out-Null;
+    }
     $installer = $updateSession.CreateUpdateInstaller();
     $installer.Updates = $updatesToInstall;
     $log += "Starting installation...";
