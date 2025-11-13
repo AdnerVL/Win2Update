@@ -101,9 +101,9 @@ echo [DEBUG] Testing log file access: !LOG_FILE! >> "%TEMP%\UpdateScriptDebug.tx
 )
 echo [DEBUG] Log file access test passed >> "%TEMP%\UpdateScriptDebug.txt"
 
-:: Run PowerShell script
-echo [DEBUG] Running PowerShell script: !SCRIPT_DIR!\UpdateScriptv1.ps1 >> "%TEMP%\UpdateScriptDebug.txt"
-powershell -NoProfile -ExecutionPolicy Bypass -File "!SCRIPT_DIR!\UpdateScriptv1.ps1" -LogPath "!LOG_FILE!" -AutoReboot > "!CONSOLE_LOG!" 2>&1
+:: Run PowerShell script (use PowerShell 7 runtime and the main script)
+echo [DEBUG] Running PowerShell script: !SCRIPT_DIR!\AdvancedRemoteUpdate.ps1 >> "%TEMP%\UpdateScriptDebug.txt"
+pwsh -NoProfile -ExecutionPolicy Bypass -File "!SCRIPT_DIR!\AdvancedRemoteUpdate.ps1" > "!CONSOLE_LOG!" 2>&1
 set "EXIT_CODE=!ERRORLEVEL!"
 echo [DEBUG] PowerShell script completed with exit code !EXIT_CODE! >> "%TEMP%\UpdateScriptDebug.txt"
 

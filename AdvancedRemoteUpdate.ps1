@@ -1,3 +1,6 @@
+#Requires -Version 7.0
+#Requires -RunAsAdministrator
+
 [CmdletBinding()]
 param(
     [Parameter(Position=0)]
@@ -13,25 +16,34 @@ param(
     [ValidateRange(0, 365)]
     [int]$SkipDays = 5,
     
-    [switch]$AutoReboot,
+    [Parameter(Position=4)]
+    [ValidateRange(1, 50)]
+    [int]$ThrottleLimit = 10,
     
     [ValidateRange(0, 86400)]
-    [int]$QueueDuration = 10800
+    [int]$QueueDuration = 3600
 )
 
-#Requires -RunAsAdministrator
 $ErrorActionPreference = "Continue"
+$script:QueueDuration = $QueueDuration
+$script:PSScriptRoot = $PSScriptRoot  # Preserve for use in parallel blocks
 
 # ============================================
-# CORE FUNCTIONS
+# THREAD-SAFE LOGGING
 # ============================================
+
+# Initialize LogLock as a global object that can be safely used across parallel contexts
+if (-not $script:LogLock) {
+    $script:LogLock = [System.Threading.Mutex]::new($false, "UpdateScriptLogMutex")
+}
 
 function Write-Log {
     param(
         [string]$Message,
         [string]$RemoteHost = "",
         [ValidateSet('Info', 'Warning', 'Error', 'Success')]
-        [string]$Level = 'Info'
+        [string]$Level = 'Info',
+        [string]$ScriptRoot = $null
     )
     
     $colors = @{
@@ -46,10 +58,25 @@ function Write-Log {
     if ($RemoteHost) { $logMessage += " [$RemoteHost]" }
     $logMessage += " $Message"
     
-    Write-Host $logMessage -ForegroundColor $colors[$Level]
-    
-    $logFile = Join-Path $PSScriptRoot ".logs\update_script.log"
-    $logMessage | Out-File -FilePath $logFile -Append -Encoding UTF8
+    # Handle both global LogLock and function-local context
+    if ($script:LogLock) {
+        $null = $script:LogLock.WaitOne()
+    }
+    try {
+        Write-Host $logMessage -ForegroundColor $colors[$Level]
+        $root = if ($ScriptRoot) { $ScriptRoot } else { $script:PSScriptRoot }
+        if ($root) {
+            $logFile = Join-Path $root ".logs\update_script.log"
+            if ($logFile) {
+                $logMessage | Out-File -FilePath $logFile -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    finally {
+        if ($script:LogLock) {
+            $script:LogLock.ReleaseMutex()
+        }
+    }
 }
 
 # ============================================
@@ -93,9 +120,10 @@ function ConvertTo-SimpleYaml {
     foreach ($system in $Data.systems) {
         $yaml += @"
 - hostname: $($system.hostname)
-  last_connection_timestamp: $($system.last_connection_timestamp ?? '')
-  last_successful_update_timestamp: $($system.last_successful_update_timestamp ?? '')
+  last_connection_timestamp: $(if ($system.last_connection_timestamp) { $system.last_connection_timestamp } else { '' })
+  last_successful_update_timestamp: $(if ($system.last_successful_update_timestamp) { $system.last_successful_update_timestamp } else { '' })
   update_success: $($system.update_success.ToString().ToLower())
+
 "@
     }
     return $yaml
@@ -153,10 +181,9 @@ function Get-HostQueue {
         Write-Log -Level Warning -Message "Error reading queue file: $_"
     }
     
-    # Clean expired entries safely
     $now = Get-Date
     $keysToRemove = $queue.Keys | Where-Object { 
-        ($now - $queue[$_]).TotalSeconds -gt $QueueDuration 
+        ($now - $queue[$_]).TotalSeconds -gt $script:QueueDuration 
     }
     foreach ($k in $keysToRemove) { $queue.Remove($k) }
     
@@ -205,7 +232,8 @@ function Get-TargetHosts {
 function Should-ProcessHost {
     param(
         [string]$RemoteHost,
-        [hashtable]$Queue
+        [hashtable]$Queue,
+        [int]$Duration
     )
     
     if (-not $Queue -or -not $Queue.ContainsKey($RemoteHost)) {
@@ -213,13 +241,12 @@ function Should-ProcessHost {
     }
     
     $elapsed = ((Get-Date) - $Queue[$RemoteHost]).TotalSeconds
-    if ($elapsed -lt $QueueDuration) {
-        $remainingMinutes = [math]::Round(($QueueDuration - $elapsed) / 60)
-        Write-Log -Message "Skipping $RemoteHost (retry in $remainingMinutes minutes)"
+    if ($elapsed -lt $Duration) {
+        $remainingMinutes = [math]::Round(($Duration - $elapsed) / 60)
+        Write-Log -Message "Skipping (retry in $remainingMinutes minutes)" -RemoteHost $RemoteHost
         return $false
     }
     
-    $Queue.Remove($RemoteHost)
     return $true
 }
 
@@ -239,32 +266,6 @@ function Should-SkipUpdate {
     }
 }
 
-function Update-HostData {
-    param(
-        [hashtable]$YamlData,
-        [string]$Hostname,
-        [bool]$UpdateSuccess,
-        [string]$UpdateTimestamp = $null,
-        [string]$ConnectionTimestamp = $null
-    )
-    
-    $hostEntry = $YamlData.systems | Where-Object { $_.hostname -eq $Hostname }
-    
-    if (-not $hostEntry) {
-        $hostEntry = @{
-            hostname = $Hostname
-            last_connection_timestamp = $ConnectionTimestamp
-            last_successful_update_timestamp = $UpdateTimestamp
-            update_success = $UpdateSuccess
-        }
-        $YamlData.systems += $hostEntry
-    } else {
-        if ($ConnectionTimestamp) { $hostEntry.last_connection_timestamp = $ConnectionTimestamp }
-        if ($UpdateTimestamp) { $hostEntry.last_successful_update_timestamp = $UpdateTimestamp }
-        $hostEntry.update_success = $UpdateSuccess
-    }
-}
-
 # ============================================
 # REMOTE UPDATE EXECUTION
 # ============================================
@@ -272,18 +273,17 @@ function Update-HostData {
 function Invoke-RemoteUpdate {
     param(
         [string]$RemoteHost,
-        [string]$PsExecPath
+        [string]$PsExecPath,
+        [string]$ScriptRoot = $null
     )
     
-    Write-Log -Message "Starting update" -RemoteHost $RemoteHost -Level Info
+    Write-Log -Message "Starting update" -RemoteHost $RemoteHost -Level Info -ScriptRoot $ScriptRoot
     
     try {
-        # Verify SMB connectivity (port 445) for PsExec
         if (-not (Test-NetConnection -ComputerName $RemoteHost -Port 445 -InformationLevel Quiet)) {
             throw "Cannot connect to SMB port 445 (required for PsExec)"
         }
         
-        # PowerShell command to execute updates
         $psCommand = @'
 $log = @(); $needsReboot = $false;
 try {
@@ -302,15 +302,13 @@ try {
     if ($searchResult.Updates.Count -eq 0) { $log += 'No updates available.'; $log | Out-String; exit 0 }
     $updatesToDownload = New-Object -ComObject Microsoft.Update.UpdateColl;
     foreach ($update in $searchResult.Updates) {
-        $log += "Processing update: $($update.Title) (KB$($update.KBArticleIDs -join ','))";
         $updatesToDownload.Add($update) | Out-Null;
-        $log += "Queued for download and install: $($update.Title)";
     }
     $downloader = $updateSession.CreateUpdateDownloader();
     $downloader.Updates = $updatesToDownload;
     $log += "Starting download of $($updatesToDownload.Count) updates...";
     $downloadResult = $downloader.Download();
-    $log += "Download completed. Result code: $($downloadResult.ResultCode) HResult: $($downloadResult.HResult)";
+    $log += "Download completed.";
     if ($downloadResult.ResultCode -ne 2) { throw "Download failed with code $($downloadResult.ResultCode)" }
     $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl;
     foreach ($update in $searchResult.Updates) {
@@ -320,14 +318,39 @@ try {
     $installer.Updates = $updatesToInstall;
     $log += "Starting installation...";
     $installResult = $installer.Install();
-    $log += "Installation completed. Result code: $($installResult.ResultCode) HResult: $($installResult.HResult)";
+    $log += "Installation completed.";
     $needsReboot = $installResult.RebootRequired;
     if ($needsReboot) { $log += 'Reboot required.' }
     $log | Out-String;
-    if ($installResult.ResultCode -eq 2) { exit 0 } else { exit 1 }
+    if ($installResult.ResultCode -eq 2) { 
+        # Run gpupdate /force
+        gpupdate /force | Out-Null
+        $log += "gpupdate /force completed.";
+        
+        # Check and install winget if not available
+        if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            $log += "winget not found. Installing...";
+            $progressPreference = 'SilentlyContinue';
+            Invoke-WebRequest -Uri https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx -OutFile Microsoft.VCLibs.x64.14.00.Desktop.appx;
+            Invoke-WebRequest -Uri https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.x64.appx -OutFile Microsoft.UI.Xaml.2.8.x64.appx;
+            Invoke-WebRequest -Uri https://aka.ms/getwinget -OutFile Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle;
+            Add-AppxPackage Microsoft.VCLibs.x64.14.00.Desktop.appx;
+            Add-AppxPackage Microsoft.UI.Xaml.2.8.x64.appx;
+            Add-AppxPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle;
+            $log += "winget installed.";
+        } else {
+            $log += "winget already available.";
+        }
+        
+        # Run winget upgrade
+        $log += "Running winget upgrade...";
+        winget upgrade --all --accept-package-agreements --accept-source-agreements --silent --include-unknown;
+        $log += "winget upgrade completed.";
+        
+        exit 0 
+    } else { exit 1 }
 } catch {
-    $log += "Exception: $($_.Exception.GetType().FullName) - $($_.Exception.Message)";
-    $log += "StackTrace: $($_.Exception.StackTrace)";
+    $log += "Exception: $($_.Exception.Message)";
     $log | Out-String; exit 1
 } finally {
     $log += "Update session ended at $(Get-Date -Format 'o')";
@@ -335,11 +358,9 @@ try {
 }
 '@
 
-        # Base64-encode the command to avoid escaping issues
         $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($psCommand))
 
-        # PsExec arguments
-        $args = @(
+        $psExecArgs = @(
             "-nobanner",
             "-accepteula",
             "-s",
@@ -347,14 +368,15 @@ try {
             "\\$RemoteHost",
             "powershell.exe",
             "-NoProfile",
-            "-ExecutionPolicy Bypass",
+            "-ExecutionPolicy",
+            "Bypass",
             "-EncodedCommand",
             $encodedCommand
         )
         
         $psi = [System.Diagnostics.ProcessStartInfo]@{
             FileName = $PsExecPath
-            Arguments = $args -join ' '
+            Arguments = "`"$($psExecArgs -join '" "')`""
             RedirectStandardOutput = $true
             RedirectStandardError = $true
             UseShellExecute = $false
@@ -362,22 +384,21 @@ try {
         }
         
         $process = [System.Diagnostics.Process]::Start($psi)
-        $timeout = 900000 # 15 minutes in milliseconds
+        $timeout = 600000  # 10 minutes
         
         if (-not $process.WaitForExit($timeout)) {
             $process.Kill()
-            throw "Update timed out after 15 minutes"
+            throw "Update timed out after 10 minutes"
         }
         
         $stdout = $process.StandardOutput.ReadToEnd()
         $stderr = $process.StandardError.ReadToEnd()
         
-        # Log output
         if ($stdout) {
             $stdout -split "`n" | ForEach-Object { if ($_) { Write-Log -Level Info -RemoteHost $RemoteHost -Message $_ } }
         }
         if ($stderr) {
-            Write-Log -Level Error -RemoteHost $RemoteHost -Message $stderr
+            Write-Log -Level Error -RemoteHost $RemoteHost -Message $stderr -ScriptRoot $ScriptRoot
         }
         
         return @{
@@ -387,7 +408,7 @@ try {
         }
         
     } catch {
-        Write-Log -Level Error -RemoteHost $RemoteHost -Message $_
+        Write-Log -Level Error -RemoteHost $RemoteHost -Message $_ -ScriptRoot $ScriptRoot
         return @{
             ExitCode = 1
             StdOut = ""
@@ -397,11 +418,66 @@ try {
 }
 
 # ============================================
+# PARALLEL HOST PROCESSING
+# ============================================
+
+function Process-SingleHost {
+    param(
+        [string]$ComputerName,
+        [hashtable]$InitialQueue,
+        [hashtable]$InitialYamlData,
+        [string]$PsExecPath,
+        [int]$SkipDays,
+        [int]$QueueDuration,
+        [string]$ScriptRoot = $null
+    )
+    
+    $result = @{
+        Hostname = $ComputerName
+        Status = 'Unknown'
+        UpdateSuccess = $false
+        NeedsQueue = $false
+    }
+    
+    try {
+        Write-Host "`n$('=' * 40)" -ForegroundColor Gray
+        Write-Log -Message "Processing host" -RemoteHost $ComputerName -Level Info -ScriptRoot $ScriptRoot
+        
+        if (-not (Should-ProcessHost -RemoteHost $ComputerName -Queue $InitialQueue -Duration $QueueDuration)) {
+            $result.Status = 'Skipped-Queue'
+            return $result
+        }
+        
+        $updateResult = Invoke-RemoteUpdate -RemoteHost $ComputerName -PsExecPath $PsExecPath -ScriptRoot $ScriptRoot
+        
+        if ($updateResult.ExitCode -eq 0) {
+            Write-Log -Level Success -RemoteHost $ComputerName -Message "Update completed successfully" -ScriptRoot $ScriptRoot
+            $result.Status = 'Success'
+            $result.UpdateSuccess = $true
+        } else {
+            Write-Log -Level Error -RemoteHost $ComputerName -Message "Update failed" -ScriptRoot $ScriptRoot
+            $result.Status = 'Failed'
+            $result.NeedsQueue = $true
+        }
+        
+    } catch {
+        Write-Log -Level Error -RemoteHost $ComputerName -Message "Processing error: $_" -ScriptRoot $ScriptRoot
+        $result.Status = 'Error'
+        $result.NeedsQueue = $true
+    }
+    
+    return $result
+}
+
+# ============================================
 # INITIALIZATION
 # ============================================
 
 function Initialize-Environment {
-    # Find PsExec
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        throw "This script requires PowerShell 7 or higher. Current version: $($PSVersionTable.PSVersion)"
+    }
+    
     $script:PsExecPath = Get-ChildItem -Path $PSScriptRoot -Filter "PsExec*.exe" | 
         Select-Object -First 1 -ExpandProperty FullName
     
@@ -409,27 +485,24 @@ function Initialize-Environment {
         throw "PsExec.exe not found in script directory"
     }
     
-    # Create required directories
     $logsDir = Join-Path $PSScriptRoot ".logs"
     if (-not (Test-Path $logsDir)) {
         New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
     }
     
-    Write-Log -Message "Environment initialized" -Level Info
+    Write-Log -Message "Environment initialized (PowerShell $($PSVersionTable.PSVersion))" -Level Info
 }
 
 # ============================================
 # MAIN EXECUTION
 # ============================================
 
-Write-Host "`nWindows Update Automation Script" -ForegroundColor Cyan
+Write-Host "`nWindows Update Automation Script (Optimized Parallel Edition)" -ForegroundColor Cyan
 Write-Host ("=" * 40) -ForegroundColor Cyan
 
 try {
-    # Initialize
     Initialize-Environment
     
-    # Load data
     $yamlData = Load-YamlData -File $YamlFile
     $hostQueue = Get-HostQueue -File $QueueFile
     $targetHosts = Get-TargetHosts -File $HostsFile
@@ -439,71 +512,294 @@ try {
         exit 1
     }
     
-    # Statistics
-    $stats = @{
-        Success = 0
-        Skipped = 0
-        Failed = 0
-        Unreachable = 0
+    Write-Log -Message "Pre-filtering hosts for connectivity and recent updates" -Level Info
+
+    # Sequential filtering (simpler and more reliable than parallel)
+    $filteredHosts = @()
+    foreach ($hostname in $targetHosts) {
+        if (-not (Test-Connection -ComputerName $hostname -Count 1 -Quiet)) { 
+            continue 
+        }
+    
+        $hostData = $yamlData.systems | Where-Object { $_.hostname -eq $hostname }
+        if (Should-SkipUpdate -HostData $hostData -Days $SkipDays) { 
+            continue 
+        }
+
+        $filteredHosts += $hostname
     }
     
-    Write-Log -Message "Processing $($targetHosts.Count) hosts" -Level Info
+    $targetHosts = $filteredHosts
     
-    # Process each host
-    foreach ($computerName in $targetHosts) {
-        Write-Host "`n$('=' * 40)" -ForegroundColor Gray
-        Write-Log -Message "Processing host" -RemoteHost $computerName -Level Info
-        
-        # Check queue
-        if (-not (Should-ProcessHost -RemoteHost $computerName -Queue $hostQueue)) {
-            $stats.Skipped++
-            continue
+    Write-Log -Message "Processing $($targetHosts.Count) hosts with throttle limit of $ThrottleLimit" -Level Info
+
+    # Parallel host processing using ForEach-Object -Parallel
+    $results = $targetHosts | ForEach-Object -Parallel {
+        # Accessing using variables
+        $computerName = $_
+        $PsExecPath = $using:script:PsExecPath
+        $SkipDays = $using:SkipDays
+        $QueueDuration = $using:QueueDuration
+        $hostQueue = $using:hostQueue
+        $yamlData = $using:yamlData
+        $scriptRoot = $using:script:PSScriptRoot
+
+        # Inline logging function
+        function Write-LogInline {
+            param(
+                [string]$Message,
+                [string]$RemoteHost = "",
+                [ValidateSet('Info', 'Warning', 'Error', 'Success')]$Level = 'Info'
+            )
+            $timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            $logMessage = "[$timestamp] [$Level]"
+            if ($RemoteHost) { $logMessage += " [$RemoteHost]" }
+            $logMessage += " $Message"
+            Write-Host $logMessage -ForegroundColor @{
+                'Error' = 'Red'; 'Warning' = 'Yellow'; 'Success' = 'Green'; 'Info' = 'White'
+            }[$Level]
+            $logFile = Join-Path $scriptRoot ".logs\update_script.log"
+            try {
+                $logMessage | Out-File -FilePath $logFile -Append -Encoding UTF8 -ErrorAction Stop
+            } catch {}
         }
-        
-        # Test connectivity
-        if (-not (Test-Connection -ComputerName $computerName -Count 1 -Quiet)) {
-            Write-Log -Level Warning -RemoteHost $computerName -Message "Host unreachable"
-            $hostQueue[$computerName] = Get-Date
-            $stats.Unreachable++
-            Update-HostData -YamlData $yamlData -Hostname $computerName -UpdateSuccess $false
-            continue
+
+        # Inline Check if should process host (skip if in queue)
+        function Should-ProcessHostInline {
+            param([string]$RemoteHost, [hashtable]$Queue, [int]$Duration)
+            if (-not $Queue -or -not $Queue.ContainsKey($RemoteHost)) { return $true }
+            $elapsed = ((Get-Date) - $Queue[$RemoteHost]).TotalSeconds
+            return $elapsed -ge $Duration
         }
-        
-        # Update connection timestamp
-        $timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        Update-HostData -YamlData $yamlData -Hostname $computerName -UpdateSuccess $false -ConnectionTimestamp $timestamp
-        
-        # Check if recently updated
+
+        # Check if should skip update
+        function Should-SkipUpdateInline {
+            param([object]$HostData, [int]$Days)
+            if (-not $HostData.last_successful_update_timestamp) { return $false }
+            try {
+                $lastUpdate = [datetime]::Parse($HostData.last_successful_update_timestamp)
+                return ((Get-Date) - $lastUpdate).TotalDays -lt $Days
+            } catch { return $false }
+        }
+
+        # Inline Should-ProcessHost check first
+        if (-not (Should-ProcessHostInline -RemoteHost $computerName -Queue $hostQueue -Duration $QueueDuration)) {
+            return @{
+                Hostname = $computerName
+                Status = 'Skipped-Queue'
+                UpdateSuccess = $false
+                NeedsQueue = $false
+            }
+        }
+
+        # Check skip based on yaml
         $hostData = $yamlData.systems | Where-Object { $_.hostname -eq $computerName }
-        if (Should-SkipUpdate -HostData $hostData -Days $SkipDays) {
-            Write-Log -Level Info -RemoteHost $computerName -Message "Recently updated, skipping"
-            $stats.Skipped++
-            continue
+        if (Should-SkipUpdateInline -HostData $hostData -Days $SkipDays) {
+            return @{
+                Hostname = $computerName
+                Status = 'Skipped-RecentUpdate'
+                UpdateSuccess = $false
+                NeedsQueue = $false
+            }
         }
-        
-        # Perform update
-        $result = Invoke-RemoteUpdate -RemoteHost $computerName -PsExecPath $PsExecPath
-        
-        if ($result.ExitCode -eq 0) {
-            Write-Log -Level Success -RemoteHost $computerName -Message "Update completed successfully"
-            $updateTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-            Update-HostData -YamlData $yamlData -Hostname $computerName -UpdateSuccess $true -UpdateTimestamp $updateTime
-            $stats.Success++
+
+        Write-LogInline -Message "Starting update" -RemoteHost $computerName -Level Info
+
+        try {
+            if (-not (Test-NetConnection -ComputerName $computerName -Port 445 -InformationLevel Quiet)) {
+                throw "Cannot connect to SMB port 445 (required for PsExec)"
+            }
+
+            $psCommand = @'
+$log = @(); $needsReboot = $false;
+try {
+    $log += "Starting update session at $(Get-Date -Format 'o')";
+    if (-not (Get-Service -Name wuauserv -ErrorAction SilentlyContinue)) {
+        $log += "Windows Update service not found"; exit 1
+    }
+    $log += "Windows Update service found.";
+    $updateSession = New-Object -ComObject Microsoft.Update.Session;
+    $log += "Update session created.";
+    $updateSearcher = $updateSession.CreateUpdateSearcher();
+    $log += "Update searcher created.";
+    $log += "Searching for updates...";
+    $searchResult = $updateSearcher.Search('IsInstalled=0');
+    $log += "Search completed. Found $($searchResult.Updates.Count) updates.";
+    if ($searchResult.Updates.Count -eq 0) { $log += 'No updates available.'; $log | Out-String; exit 0 }
+    $updatesToDownload = New-Object -ComObject Microsoft.Update.UpdateColl;
+    foreach ($update in $searchResult.Updates) {
+        $updatesToDownload.Add($update) | Out-Null;
+    }
+    $downloader = $updateSession.CreateUpdateDownloader();
+    $downloader.Updates = $updatesToDownload;
+    $log += "Starting download of $($updatesToDownload.Count) updates...";
+    $downloadResult = $downloader.Download();
+    $log += "Download completed.";
+    if ($downloadResult.ResultCode -ne 2) { throw "Download failed with code $($downloadResult.ResultCode)" }
+    $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl;
+    foreach ($update in $searchResult.Updates) {
+        $updatesToInstall.Add($update) | Out-Null;
+    }
+    $installer = $updateSession.CreateUpdateInstaller();
+    $installer.Updates = $updatesToInstall;
+    $log += "Starting installation...";
+    $installResult = $installer.Install();
+    $log += "Installation completed.";
+    $needsReboot = $installResult.RebootRequired;
+    if ($needsReboot) { $log += 'Reboot required.' }
+    $log | Out-String;
+    if ($installResult.ResultCode -eq 2) {
+        # Run gpupdate /force
+        gpupdate /force | Out-Null
+        $log += "gpupdate /force completed.";
+
+        # Check and install winget if not available
+        if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            $log += "winget not found. Installing...";
+            $progressPreference = 'SilentlyContinue';
+            Invoke-WebRequest -Uri https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx -OutFile Microsoft.VCLibs.x64.14.00.Desktop.appx;
+            Invoke-WebRequest -Uri https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.x64.appx -OutFile Microsoft.UI.Xaml.2.8.x64.appx;
+            Invoke-WebRequest -Uri https://aka.ms/getwinget -OutFile Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle;
+            Add-AppxPackage Microsoft.VCLibs.x64.14.00.Desktop.appx;
+            Add-AppxPackage Microsoft.UI.Xaml.2.8.x64.appx;
+            Add-AppxPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle;
+            $log += "winget installed.";
         } else {
-            Write-Log -Level Error -RemoteHost $computerName -Message "Update failed"
-            Update-HostData -YamlData $yamlData -Hostname $computerName -UpdateSuccess $false
-            $hostQueue[$computerName] = Get-Date
-            $stats.Failed++
+            $log += "winget already available.";
+        }
+
+        # Run winget upgrade
+        $log += "Running winget upgrade...";
+        winget upgrade --all --accept-package-agreements --accept-source-agreements --silent --include-unknown;
+        $log += "winget upgrade completed.";
+
+        exit 0
+    } else { exit 1 }
+} catch {
+    $log += "Exception: $($_.Exception.Message)";
+    $log | Out-String; exit 1
+} finally {
+    $log += "Update session ended at $(Get-Date -Format 'o')";
+    $log | Out-String
+}
+'@
+
+            $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($psCommand))
+
+            $psExecArgs = @(
+                "-nobanner",
+                "-accepteula",
+                "-s",
+                "-h",
+                "\\$computerName",
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                $encodedCommand
+            )
+
+            $psi = [System.Diagnostics.ProcessStartInfo]@{
+                FileName = $PsExecPath
+                Arguments = "`"$($psExecArgs -join '" "')`""
+                RedirectStandardOutput = $true
+                RedirectStandardError = $true
+                UseShellExecute = $false
+                CreateNoWindow = $true
+            }
+
+            $process = [System.Diagnostics.Process]::Start($psi)
+            $timeout = 600000  # 10 minutes
+
+            if (-not $process.WaitForExit($timeout)) {
+                $process.Kill()
+                throw "Update timed out after 10 minutes"
+            }
+
+            $stdout = $process.StandardOutput.ReadToEnd()
+            $stderr = $process.StandardError.ReadToEnd()
+
+            if ($stdout) {
+                $stdout -split "`n" | Where-Object { $_ } | ForEach-Object { Write-LogInline -Level Info -RemoteHost $computerName -Message $_ }
+            }
+            if ($stderr) {
+                Write-LogInline -Level Error -RemoteHost $computerName -Message $stderr
+            }
+
+            $exitCode = $process.ExitCode
+
+        } catch {
+            Write-LogInline -Level Error -RemoteHost $computerName -Message $_
+            $exitCode = 1
+        }
+
+        if ($exitCode -eq 0) {
+            Write-LogInline -Level Success -RemoteHost $computerName -Message "Update completed successfully"
+            return @{
+                Hostname = $computerName
+                Status = 'Success'
+                UpdateSuccess = $true
+                NeedsQueue = $false
+            }
+        } else {
+            Write-LogInline -Level Error -RemoteHost $computerName -Message "Update failed"
+            return @{
+                Hostname = $computerName
+                Status = 'Failed'
+                UpdateSuccess = $false
+                NeedsQueue = $true
+            }
+        }
+    } -ThrottleLimit $ThrottleLimit
+    
+    $timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    
+    foreach ($result in $results) {
+        $hostEntry = $yamlData.systems | Where-Object { $_.hostname -eq $result.Hostname }
+        
+        if (-not $hostEntry) {
+            $hostEntry = @{
+                hostname = $result.Hostname
+                last_connection_timestamp = $timestamp
+                last_successful_update_timestamp = $null
+                update_success = $false
+            }
+            $yamlData.systems += $hostEntry
         }
         
-        # Save progress
-        Save-YamlData -Data $yamlData -File $YamlFile
+        switch ($result.Status) {
+            'Success' {
+                $hostEntry.last_connection_timestamp = $timestamp
+                $hostEntry.last_successful_update_timestamp = $timestamp
+                $hostEntry.update_success = $true
+            }
+            'Failed' {
+                $hostEntry.last_connection_timestamp = $timestamp
+                $hostEntry.update_success = $false
+                if ($result.NeedsQueue) {
+                    $hostQueue[$result.Hostname] = Get-Date
+                }
+            }
+            'Error' {
+                $hostEntry.update_success = $false
+                if ($result.NeedsQueue) {
+                    $hostQueue[$result.Hostname] = Get-Date
+                }
+            }
+        }
     }
     
-    # Save final state
+    Save-YamlData -Data $yamlData -File $YamlFile
     Save-HostQueue -Queue $hostQueue -File $QueueFile
     
-    # Display summary
+    $stats = @{
+        Success = ($results | Where-Object { $_.Status -eq 'Success' }).Count
+        Skipped = ($results | Where-Object { $_.Status -like 'Skipped-*' }).Count
+        Failed = ($results | Where-Object { $_.Status -eq 'Failed' }).Count
+        Error = ($results | Where-Object { $_.Status -eq 'Error' }).Count
+    }
+    
     Write-Host "`n$('=' * 40)" -ForegroundColor Cyan
     Write-Host "EXECUTION SUMMARY" -ForegroundColor Cyan
     Write-Host "$('=' * 40)" -ForegroundColor Cyan
@@ -511,7 +807,7 @@ try {
     Write-Host "Successful:     $($stats.Success)" -ForegroundColor Green
     Write-Host "Skipped:        $($stats.Skipped)" -ForegroundColor Yellow
     Write-Host "Failed:         $($stats.Failed)" -ForegroundColor Red
-    Write-Host "Unreachable:    $($stats.Unreachable)" -ForegroundColor Red
+    Write-Host "Errors:         $($stats.Error)" -ForegroundColor Red
     Write-Host "Queued:         $($hostQueue.Count)" -ForegroundColor Yellow
     
     if ($hostQueue.Count -gt 0) {
@@ -528,5 +824,8 @@ try {
     Write-Log -Level Error -Message "Script error: $_"
     exit 1
 } finally {
+    if ($script:LogLock) {
+        $script:LogLock.Dispose()
+    }
     Write-Host "`nScript completed" -ForegroundColor Green
 }

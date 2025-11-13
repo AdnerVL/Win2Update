@@ -14,11 +14,18 @@ $queueDuration = 3 * 60 * 60                                              # Queu
 # Load or initialize the host queue (for retrying unreachable hosts)
 $hostQueue = @{}
 if (Test-Path -Path $queueFile) {
-    $queuedData = Get-Content -Path $queueFile | ForEach-Object {
-        $hostName, $timeStamp = $_ -split ','
-        [PSCustomObject]@{ Host = $hostName; TimeStamp = [DateTime]::Parse($timeStamp) }
+    Get-Content -Path $queueFile | ForEach-Object {
+        if ($_ -and ($_ -match ',')) {
+            $parts = $_ -split ','
+            $hostName = $parts[0].Trim()
+            $timeStamp = $parts[1].Trim()
+            try {
+                $hostQueue[$hostName] = [DateTime]::Parse($timeStamp)
+            } catch {
+                # Ignore parse errors for individual entries
+            }
+        }
     }
-    $queuedData | ForEach-Object { $hostQueue[$_.Key] = $_.Value }
 }
 
 # Helper function to update the queue file
