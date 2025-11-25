@@ -281,180 +281,10 @@ function Should-SkipUpdate {
 }
 
 # ============================================
-# REMOTE UPDATE EXECUTION
+# PARALLEL HOST PROCESSING (updated to remove duplication by eliminating Invoke-RemoteUpdate)
 # ============================================
 
-function Invoke-RemoteUpdate {
-    param(
-        [string]$RemoteHost,
-        [string]$PsExecPath,
-        [string]$ScriptRoot = $null
-    )
-    
-    Write-Log -Message "Starting update" -RemoteHost $RemoteHost -Level Info -ScriptRoot $ScriptRoot
-    
-    try {
-        if (-not (Test-NetConnection -ComputerName $RemoteHost -Port 445 -InformationLevel Quiet -WarningAction SilentlyContinue)) {
-            throw "Cannot connect to SMB port 445 (required for PsExec)"
-        }
-        
-        # Updated $psCommand: Uses only MS tools (Windows Update COM + winget auto-install for apps). Omits -s flag in PsExec for user context.
-        $psCommand = @'
-$ProgressPreference = 'SilentlyContinue'
-$log = @(); $needsReboot = $false; $exitCode = 0
-try {
-    $log += "Starting update session at $(Get-Date -Format 'o')";
-    if (-not (Get-Service -Name wuauserv -ErrorAction SilentlyContinue)) {
-        throw "Windows Update service not found"
-    }
-    $log += "Windows Update service found.";
-    $updateSession = New-Object -ComObject Microsoft.Update.Session;
-    $log += "Update session created.";
-    $updateSearcher = $updateSession.CreateUpdateSearcher();
-    $log += "Update searcher created.";
-    $log += "Searching for updates...";
-    $searchResult = $updateSearcher.Search('IsInstalled=0 and IsHidden=0');
-    $log += "Search completed. Found $($searchResult.Updates.Count) updates.";
-    if ($searchResult.Updates.Count -eq 0) { 
-        $log += 'No updates available. System is up to date.';
-        $log | Out-String; 
-        exit 0  # Treat as success
-    }
-
-    $updatesToDownload = New-Object -ComObject Microsoft.Update.UpdateColl;
-    foreach ($update in $searchResult.Updates) {
-        if ($update.IsHidden) { continue }
-        $updatesToDownload.Add($update) | Out-Null;
-    }
-
-    $downloader = $updateSession.CreateUpdateDownloader();
-    $downloader.Updates = $updatesToDownload;
-    $log += "Starting download of $($downloader.Updates.Count) updates...";
-    $downloadResult = $downloader.Download();
-    $log += "Download completed. ResultCode: $($downloadResult.ResultCode)";
-    if ($downloadResult.ResultCode -notin @(2,3)) { throw "Download failed with code $($downloadResult.ResultCode)" }
-
-    $updatesToInstall = $updatesToDownload
-    $installer = $updateSession.CreateUpdateInstaller();
-    $installer.Updates = $updatesToInstall;
-    $log += "Starting installation of $($updatesToInstall.Count) updates...";
-    $installResult = $installer.Install();
-    $log += "Installation completed. ResultCode: $($installResult.ResultCode); RebootRequired: $($installResult.RebootRequired)";
-    $needsReboot = $installResult.RebootRequired;
-    if ($needsReboot) { $log += 'Reboot required.' }
-
-    if ($installResult.ResultCode -in @(2,3)) {
-        $exitCode = 0
-        try {
-            Start-Process -FilePath gpupdate -ArgumentList '/force' -NoNewWindow -Wait
-            $log += "gpupdate /force completed.";
-        } catch { $log += "gpupdate failed: $($_.Exception.Message)" }
-
-        # Use winget for non-Store app updates (auto-install if missing, per [learn.microsoft.com](https://learn.microsoft.com/en-us/windows/package-manager/winget/))
-        # Note: Microsoft Store apps cannot be upgraded via winget/PowerShell ([github.com](https://github.com/microsoft/winget-cli/issues/2854))
-        $wingetWorked = $false
-        if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-            $log += "Winget not found; installing via Microsoft (aka.ms/getwinget).";
-            try {
-                $wingetUrl = "https://aka.ms/getwinget"  # Official MS installer ([learn.microsoft.com](https://learn.microsoft.com/en-us/windows/package-manager/winget/))
-                $tempPath = Join-Path $env:TEMP "winget.msix"
-                Invoke-WebRequest -Uri $wingetUrl -OutFile $tempPath -UseBasicParsing
-                Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$tempPath`" /quiet /norestart" -Wait -NoNewWindow  # Silent install
-                Remove-Item $tempPath -ErrorAction SilentlyContinue
-            } catch { $log += "Winget install failed: $($_.Exception.Message)" }
-        }
-        if (Get-Command winget -ErrorAction SilentlyContinue) {
-            try {
-                $log += "Running winget upgrade --all --accept-package-agreements --accept-source-agreements --silent --include-unknown";
-                & winget upgrade --all --accept-package-agreements --accept-source-agreements --silent --include-unknown  # Full command with MS-developed flags ([learn.microsoft.com](https://learn.microsoft.com/en-us/windows/package-manager/winget/upgrade))
-                if ($LASTEXITCODE -eq 0) {
-                    $log += "Winget upgrades completed.";
-                    $wingetWorked = $true
-                } else {
-                    $log += "Winget upgrade failed with code $LASTEXITCODE."
-                }
-            } catch { $log += "Winget execution failed: $($_.Exception.Message)" }
-        } else {
-            $log += "Winget install failed; skipping app upgrades (Microsoft Store apps require manual updates).";
-        }
-        if (-not $wingetWorked) { $log += "Note: Microsoft Store apps cannot be upgraded via winget/PowerShell ([github.com](https://github.com/microsoft/winget-cli/issues/2854)). Manually check Windows Store for updates." }
-    } else {
-        throw "Install failed with code $($installResult.ResultCode)"
-    }
-} catch {
-    $log += "Exception: $($_.Exception.Message)";
-    $exitCode = 1
-} finally {
-    $log += "Update session ended at $(Get-Date -Format 'o')";
-    $log | Out-String
-    exit $exitCode
-}
-'@
-
-        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($psCommand))
-
-        # Updated PsExec args: Removed -s to run in user context (avoids "No package found" errors in admin mode ([community.spiceworks.com](https://community.spiceworks.com/t/winget-fails-to-upgrade-apps-when-run-as-system/1058983))). Uses -h for highest privileges.
-        $psExecArgs = @(
-            "-nobanner",
-            "-accepteula",
-            "-h",  # Highest privileges (no SYSTEM)
-            "\\$RemoteHost",
-            "powershell.exe",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-EncodedCommand",
-            $encodedCommand
-        )
-        
-        $psi = [System.Diagnostics.ProcessStartInfo]@{
-            FileName = $PsExecPath
-            Arguments = "`"$($psExecArgs -join '" "')`""
-            RedirectStandardOutput = $true
-            RedirectStandardError = $true
-            UseShellExecute = $false
-            CreateNoWindow = $true
-        }
-        
-        $process = [System.Diagnostics.Process]::Start($psi)
-        $timeout = 600000  # 10 minutes
-        
-        if (-not $process.WaitForExit($timeout)) {
-            $process.Kill()
-            throw "Update timed out after 10 minutes"
-        }
-        
-        $stdout = $process.StandardOutput.ReadToEnd()
-        $stderr = $process.StandardError.ReadToEnd()
-        
-        if ($stdout) {
-            $stdout -split "`n" | ForEach-Object { if ($_) { Write-Log -Level Info -RemoteHost $RemoteHost -Message $_ } }
-        }
-        if ($stderr) {
-            Write-Log -Level Error -RemoteHost $RemoteHost -Message $stderr -ScriptRoot $ScriptRoot
-        }
-        
-        return @{
-            ExitCode = $process.ExitCode
-            StdOut = $stdout
-            StdErr = $stderr
-        }
-        
-    } catch {
-        Write-Log -Level Error -RemoteHost $RemoteHost -Message $_ -ScriptRoot $ScriptRoot
-        return @{
-            ExitCode = 1
-            StdOut = ""
-            StdErr = $_.Exception.Message
-        }
-    }
-}
-
-# ============================================
-# PARALLEL HOST PROCESSING (updated inline)
-# ============================================
-
-function Process-SingleHost { ... }  # Unchanged
+function Process-SingleHost { ... }  # Unchanged (if used elsewhere, else remove)
 
 # ============================================
 # INITIALIZATION (unchanged)
@@ -545,7 +375,7 @@ try {
         $scriptRoot = $using:script:PSScriptRoot
         $effectiveForce = $using:effectiveForce
 
-        # Inline logging function
+        # Inline logging function (smarter to avoid duplication)
         function Write-LogInline {
             param(
                 [string]$Message,
@@ -565,7 +395,7 @@ try {
             } catch {}
         }
 
-        # Inline queue check logic
+        # Inline queue check logic (shared)
         function Should-ProcessHostInline {
             param([string]$RemoteHost, [hashtable]$Queue, [int]$Duration, [bool]$Force)
             if ($Force) { return $true }
@@ -574,7 +404,7 @@ try {
             return $elapsed -ge $Duration
         }
 
-        # Inline skip check logic
+        # Inline skip check logic (shared)
         function Should-SkipUpdateInline {
             param([object]$HostData, [int]$Days)
             if (-not $HostData.last_successful_update_timestamp) { return $false }
@@ -650,7 +480,6 @@ try {
     $log += "Download completed. ResultCode: $($downloadResult.ResultCode)";
     if ($downloadResult.ResultCode -notin @(2,3)) { throw "Download failed with code $($downloadResult.ResultCode)" }
 
-    # Reuse downloaded collection for install
     $updatesToInstall = $updatesToDownload
     $installer = $updateSession.CreateUpdateInstaller();
     $installer.Updates = $updatesToInstall;
@@ -667,43 +496,34 @@ try {
             $log += "gpupdate /force completed.";
         } catch { $log += "gpupdate failed: $($_.Exception.Message)" }
 
+        # Attempt to install Winget if missing (added here to fix parallel mode)
+        if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            $log += "Winget not found; installing via Microsoft (aka.ms/getwinget).";
+            try {
+                $wingetUrl = "https://aka.ms/getwinget"  # Official MS installer ([learn.microsoft.com](https://learn.microsoft.com/en-us/windows/package-manager/winget/))
+                $tempPath = Join-Path $env:TEMP "winget.msix"
+                Invoke-WebRequest -Uri $wingetUrl -OutFile $tempPath -UseBasicParsing
+                Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$tempPath`" /quiet /norestart" -Wait -NoNewWindow  # Silent install
+                Remove-Item $tempPath -ErrorAction SilentlyContinue
+            } catch { $log += "Winget install failed: $($_.Exception.Message)" }
+        }
+        # Now check and run Winget
         if (Get-Command winget -ErrorAction SilentlyContinue) {
             $wingetWorked = $false
             try {
-                $log += "Running winget upgrade --all...";
-                $wingetOutput = & winget upgrade --all --accept-package-agreements --accept-source-agreements --silent --include-unknown 2>&1
-                $log += "winget upgrade completed.";
-                $wingetWorked = $true
-            } catch { 
-                $log += "winget execution failed: $($_.Exception.Message)"
-                # Attempt repair if 'winget' is not recognized or fails
-                if ($_.Exception.Message -match 'winget.*not recognized' -or $LASTEXITCODE -ne 0) {
-                    $log += "Attempting to repair Winget installation";
-                    try {
-                        # Reinstall Winget
-                        $wingetUrl = "https://github.com/microsoft/winget-cli/releases/download/v1.7.10882-preview/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"
-                        $tempPath = Join-Path $env:TEMP "WingetInstaller.msixbundle"
-                        Invoke-WebRequest -Uri $wingetUrl -OutFile $tempPath -UseBasicParsing
-                        Start-Process -FilePath "cmd.exe" -ArgumentList "/c \`"$tempPath\`" /quiet /norestart" -Wait -NoNewWindow
-                        Remove-Item $tempPath -ErrorAction SilentlyContinue
-                        $env:Path += ";$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_1.21.24171.0_neutral__8wekyb3d8bbwe\"
-                        if (Get-Command winget -ErrorAction SilentlyContinue) {
-                            $log += "Winget repaired; retrying upgrade.";
-                            try {
-                                $wingetOutput = & winget upgrade --all --accept-package-agreements --accept-source-agreements --silent --include-unknown 2>&1
-                                $log += "winget upgrade completed after repair.";
-                                $wingetWorked = $true
-                            } catch { $log += "Winget upgrade failed even after repair: $($_.Exception.Message)" }
-                        } else {
-                            $log += "Winget repair failed; skipping winget upgrades.";
-                        }
-                    } catch { $log += "Winget repair error: $($_.Exception.Message)" }
+                $log += "Running winget upgrade --all --accept-package-agreements --accept-source-agreements --silent --include-unknown";
+                & winget upgrade --all --accept-package-agreements --accept-source-agreements --silent --include-unknown  # Full command with MS-developed flags ([learn.microsoft.com](https://learn.microsoft.com/en-us/windows/package-manager/winget/upgrade))
+                if ($LASTEXITCODE -eq 0) {
+                    $log += "Winget upgrades completed.";
+                    $wingetWorked = $true
+                } else {
+                    $log += "Winget upgrade failed with code $LASTEXITCODE."
                 }
-            }
-            if (-not $wingetWorked) { $log += "winget upgrades were not successful." }
+            } catch { $log += "Winget execution failed: $($_.Exception.Message)" }
         } else {
-            $log += "winget not found; skipping winget upgrades.";
+            $log += "Winget install failed; skipping app upgrades (Microsoft Store apps require manual updates).";
         }
+        if (-not $wingetWorked) { $log += "Note: Microsoft Store apps cannot be upgraded via winget/PowerShell ([github.com](https://github.com/microsoft/winget-cli/issues/2854)). Manually check Windows Store for updates." }
     } else {
         throw "Install failed with code $($installResult.ResultCode)"
     }
