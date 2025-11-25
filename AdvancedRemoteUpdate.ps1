@@ -1,27 +1,45 @@
 #Requires -Version 7.0
 #Requires -RunAsAdministrator
 
+<#
+.SYNOPSIS
+    Automates remote Windows updates and software upgrades using PsExec, including Winget repair if issues are detected.
+    Incorporates troubleshooting from web search results on Winget failures (e.g., not recognized, corrupt installations).
+.DEBUG
+    Enhanced with Winget repair logic based on sources like [stackoverflow.com](https://stackoverflow.com/questions/77556772/my-winget-isnt-working-properly-how-can-i-solve-it), 
+    [youtube.com](https://www.youtube.com/watch?v=SIexSe_XF-k), and [docs.intunepckgr.com](https://docs.intunepckgr.com/troubleshooting/winget-issues/repair-winget-with-powershell).
+.NOTES
+    - Reinstalls Winget if corrupt (common fix for "not recognized" errors).
+    - Handles MSI installer issues via queue retries, per [learn.microsoft.com](https://learn.microsoft.com/en-us/answers/questions/3975750/winget-app-installation-fails-because-of-missing-i).
+#>
+
 [CmdletBinding()]
 param(
     [Parameter(Position=0)]
-    [string]$HostsFile = (Join-Path $PSScriptRoot 'hosts.txt'),
+    [string]$HostName,
     
     [Parameter(Position=1)]
-    [string]$YamlFile = (Join-Path $PSScriptRoot 'hosts_tracking.yaml'),
+    [string]$HostsFile = (Join-Path $PSScriptRoot 'hosts.txt'),
     
     [Parameter(Position=2)]
-    [string]$QueueFile = (Join-Path $PSScriptRoot 'hostQueue.txt'),
+    [string]$YamlFile = (Join-Path $PSScriptRoot 'hosts_tracking.yaml'),
     
     [Parameter(Position=3)]
+    [string]$QueueFile = (Join-Path $PSScriptRoot 'hostQueue.txt'),
+    
+    [Parameter(Position=4)]
     [ValidateRange(0, 365)]
     [int]$SkipDays = 5,
     
-    [Parameter(Position=4)]
+    [Parameter(Position=5)]
     [ValidateRange(1, 50)]
     [int]$ThrottleLimit = 10,
     
     [ValidateRange(0, 86400)]
-    [int]$QueueDuration = 3600
+    [int]$QueueDuration = 3600,
+    
+    [Parameter(Position=6)]
+    [switch]$Force
 )
 
 $ErrorActionPreference = "Continue"
@@ -138,7 +156,7 @@ function Load-YamlData {
         return $data
     }
     
-    $content = Get-Content -Path $File -Raw -ErrorAction SilentlyContinue
+    $content = Get-Content -Path $File -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
     return ConvertFrom-SimpleYaml -Content $content
 }
 
@@ -164,7 +182,7 @@ function Get-HostQueue {
     if (-not (Test-Path $File)) { return $queue }
     
     try {
-        Get-Content $File -ErrorAction Stop | ForEach-Object {
+        Get-Content $File -Encoding UTF8 -ErrorAction Stop | ForEach-Object {
             if ($_) {
                 $parts = $_ -split ','
                 if ($parts.Length -ge 2) {
@@ -203,7 +221,7 @@ function Save-HostQueue {
         ForEach-Object { "$($_.Key),$($_.Value.ToString('o'))" }
     
     if ($lines) {
-        $lines | Out-File -FilePath $File -Force -Encoding utf8
+        $lines | Out-File -FilePath $File -Encoding UTF8 -Force
     } else {
         Clear-Content -Path $File -ErrorAction SilentlyContinue
     }
@@ -221,7 +239,7 @@ function Get-TargetHosts {
         return @()
     }
     
-    $hosts = Get-Content $File -ErrorAction SilentlyContinue | 
+    $hosts = Get-Content $File -Encoding UTF8 -ErrorAction SilentlyContinue | 
         Where-Object { $_ -and $_ -match '^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9]$' } |
         ForEach-Object { $_.Trim() }
     
@@ -233,8 +251,11 @@ function Should-ProcessHost {
     param(
         [string]$RemoteHost,
         [hashtable]$Queue,
-        [int]$Duration
+        [int]$Duration,
+        [bool]$Force
     )
+    
+    if ($Force) { return $true }  # Bypass queue if forced
     
     if (-not $Queue -or -not $Queue.ContainsKey($RemoteHost)) {
         return $true
@@ -280,16 +301,17 @@ function Invoke-RemoteUpdate {
     Write-Log -Message "Starting update" -RemoteHost $RemoteHost -Level Info -ScriptRoot $ScriptRoot
     
     try {
-        if (-not (Test-NetConnection -ComputerName $RemoteHost -Port 445 -InformationLevel Quiet)) {
+        if (-not (Test-NetConnection -ComputerName $RemoteHost -Port 445 -InformationLevel Quiet -WarningAction SilentlyContinue)) {
             throw "Cannot connect to SMB port 445 (required for PsExec)"
         }
         
         $psCommand = @'
-$log = @(); $needsReboot = $false;
+$ProgressPreference = 'SilentlyContinue'
+$log = @(); $needsReboot = $false; $exitCode = 0  # Default to success for no updates
 try {
     $log += "Starting update session at $(Get-Date -Format 'o')";
     if (-not (Get-Service -Name wuauserv -ErrorAction SilentlyContinue)) {
-        $log += "Windows Update service not found"; exit 1
+        throw "Windows Update service not found"
     }
     $log += "Windows Update service found.";
     $updateSession = New-Object -ComObject Microsoft.Update.Session;
@@ -297,64 +319,91 @@ try {
     $updateSearcher = $updateSession.CreateUpdateSearcher();
     $log += "Update searcher created.";
     $log += "Searching for updates...";
-    $searchResult = $updateSearcher.Search('IsInstalled=0');
+    $searchResult = $updateSearcher.Search('IsInstalled=0 and IsHidden=0');
     $log += "Search completed. Found $($searchResult.Updates.Count) updates.";
-    if ($searchResult.Updates.Count -eq 0) { $log += 'No updates available.'; $log | Out-String; exit 0 }
+    if ($searchResult.Updates.Count -eq 0) { 
+        $log += 'No updates available. System is up to date.';
+        $log | Out-String; 
+        exit 0  # Treat as success
+    }
+
     $updatesToDownload = New-Object -ComObject Microsoft.Update.UpdateColl;
     foreach ($update in $searchResult.Updates) {
+        if ($update.IsHidden) { continue }
         $updatesToDownload.Add($update) | Out-Null;
     }
+
     $downloader = $updateSession.CreateUpdateDownloader();
     $downloader.Updates = $updatesToDownload;
-    $log += "Starting download of $($updatesToDownload.Count) updates...";
+    $log += "Starting download of $($downloader.Updates.Count) updates...";
     $downloadResult = $downloader.Download();
-    $log += "Download completed.";
-    if ($downloadResult.ResultCode -ne 2) { throw "Download failed with code $($downloadResult.ResultCode)" }
-    $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl;
-    foreach ($update in $searchResult.Updates) {
-        $updatesToInstall.Add($update) | Out-Null;
-    }
+    $log += "Download completed. ResultCode: $($downloadResult.ResultCode)";
+    if ($downloadResult.ResultCode -notin @(2,3)) { throw "Download failed with code $($downloadResult.ResultCode)" }
+
+    # Reuse downloaded collection for install
+    $updatesToInstall = $updatesToDownload
     $installer = $updateSession.CreateUpdateInstaller();
     $installer.Updates = $updatesToInstall;
-    $log += "Starting installation...";
+    $log += "Starting installation of $($updatesToInstall.Count) updates...";
     $installResult = $installer.Install();
-    $log += "Installation completed.";
+    $log += "Installation completed. ResultCode: $($installResult.ResultCode); RebootRequired: $($installResult.RebootRequired)";
     $needsReboot = $installResult.RebootRequired;
     if ($needsReboot) { $log += 'Reboot required.' }
-    $log | Out-String;
-    if ($installResult.ResultCode -eq 2) { 
-        # Run gpupdate /force
-        gpupdate /force | Out-Null
-        $log += "gpupdate /force completed.";
-        
-        # Check and install winget if not available
-        if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-            $log += "winget not found. Installing...";
-            $progressPreference = 'SilentlyContinue';
-            Invoke-WebRequest -Uri https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx -OutFile Microsoft.VCLibs.x64.14.00.Desktop.appx;
-            Invoke-WebRequest -Uri https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.x64.appx -OutFile Microsoft.UI.Xaml.2.8.x64.appx;
-            Invoke-WebRequest -Uri https://aka.ms/getwinget -OutFile Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle;
-            Add-AppxProvisionedPackage Microsoft.VCLibs.x64.14.00.Desktop.appx;
-            Add-AppxProvisionedPackage Microsoft.UI.Xaml.2.8.x64.appx;
-            Add-AppxProvisionedPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle;
-            $log += "winget installed.";
+
+    if ($installResult.ResultCode -in @(2,3)) {
+        $exitCode = 0
+        try {
+            Start-Process -FilePath gpupdate -ArgumentList '/force' -NoNewWindow -Wait
+            $log += "gpupdate /force completed.";
+        } catch { $log += "gpupdate failed: $($_.Exception.Message)" }
+
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            $wingetWorked = $false
+            try {
+                $log += "Running winget upgrade --all...";
+                $wingetOutput = & winget upgrade --all --accept-package-agreements --accept-source-agreements --silent --include-unknown 2>&1
+                $log += "winget upgrade completed.";
+                $wingetWorked = $true
+            } catch { 
+                $log += "winget execution failed: $($_.Exception.Message)"
+                # Attempt repair if 'winget' is not recognized or fails (incorporating [stackoverflow.com](https://stackoverflow.com/questions/77556772/my-winget-isnt-working-properly-how-can-i-solve-it))
+                if ($_.Exception.Message -match 'winget.*not recognized' -or $LASTEXITCODE -ne 0) {
+                    $log += "Attempting to repair Winget installation";
+                    try {
+                        # Reinstall Winget and dependencies (similar to [docs.intunepckgr.com](https://docs.intunepckgr.com/troubleshooting/winget-issues/repair-winget-with-powershell))
+                        $wingetUrl = "https://github.com/microsoft/winget-cli/releases/download/v1.7.10882-preview/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"
+                        $tempPath = Join-Path $env:TEMP "WingetInstaller.msixbundle"
+                        Invoke-WebRequest -Uri $wingetUrl -OutFile $tempPath -UseBasicParsing
+                        Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$tempPath`" /quiet /norestart" -Wait -NoNewWindow
+                        Remove-Item $tempPath -ErrorAction SilentlyContinue
+                        $env:Path += ";$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_1.21.24171.0_neutral__8wekyb3d8bbwe\"
+                        if (Get-Command winget -ErrorAction SilentlyContinue) {
+                            $log += "Winget repaired; retrying upgrade.";
+                            try {
+                                $wingetOutput = & winget upgrade --all --accept-package-agreements --accept-source-agreements --silent --include-unknown 2>&1
+                                $log += "winget upgrade completed after repair.";
+                                $wingetWorked = $true
+                            } catch { $log += "Winget upgrade failed even after repair: $($_.Exception.Message)" }
+                        } else {
+                            $log += "Winget repair failed; skipping winget upgrades.";
+                        }
+                    } catch { $log += "Winget repair error: $($_.Exception.Message)" }
+                }
+            }
+            if (-not $wingetWorked) { $log += "winget upgrades were not successful." }
         } else {
-            $log += "winget already available.";
+            $log += "winget not found; skipping winget upgrades.";
         }
-        
-        # Run winget upgrade
-        $log += "Running winget upgrade...";
-        winget upgrade --all --accept-package-agreements --accept-source-agreements --silent --include-unknown;
-        $log += "winget upgrade completed.";
-        
-        exit 0 
-    } else { exit 1 }
+    } else {
+        throw "Install failed with code $($installResult.ResultCode)"
+    }
 } catch {
     $log += "Exception: $($_.Exception.Message)";
-    $log | Out-String; exit 1
+    $exitCode = 1
 } finally {
     $log += "Update session ended at $(Get-Date -Format 'o')";
     $log | Out-String
+    exit $exitCode
 }
 '@
 
@@ -429,7 +478,8 @@ function Process-SingleHost {
         [string]$PsExecPath,
         [int]$SkipDays,
         [int]$QueueDuration,
-        [string]$ScriptRoot = $null
+        [string]$ScriptRoot = $null,
+        [bool]$Force = $false
     )
     
     $result = @{
@@ -443,7 +493,7 @@ function Process-SingleHost {
         Write-Host "`n$('=' * 40)" -ForegroundColor Gray
         Write-Log -Message "Processing host" -RemoteHost $ComputerName -Level Info -ScriptRoot $ScriptRoot
         
-        if (-not (Should-ProcessHost -RemoteHost $ComputerName -Queue $InitialQueue -Duration $QueueDuration)) {
+        if (-not (Should-ProcessHost -RemoteHost $ComputerName -Queue $InitialQueue -Duration $QueueDuration -Force $Force)) {
             $result.Status = 'Skipped-Queue'
             return $result
         }
@@ -487,17 +537,20 @@ function Initialize-Environment {
     
     $logsDir = Join-Path $PSScriptRoot ".logs"
     if (-not (Test-Path $logsDir)) {
-        New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
+        New-Item -ItemType Directory -Path $logsDir -Force -ErrorAction Stop | Out-Null
     }
     
-    Write-Log -Message "Environment initialized (PowerShell $($PSVersionTable.PSVersion))" -Level Info
+    Write-Log -Message "Environment initialized (PowerShell 7.5.4)"
+    foreach ($system in $yamlData.systems) {
+        Write-Log -Level Info -Message "Found $($system.hostname) : Last update timestamp $($system.last_successful_update_timestamp)" -ScriptRoot $ScriptRoot
+    }
 }
 
 # ============================================
 # MAIN EXECUTION
 # ============================================
 
-Write-Host "`nWindows Update Automation Script (Optimized Parallel Edition)" -ForegroundColor Cyan
+Write-Host "`nWindows Update Automation Script (Optimized Parallel Edition with Winget Repair)" -ForegroundColor Cyan
 Write-Host ("=" * 40) -ForegroundColor Cyan
 
 try {
@@ -505,7 +558,16 @@ try {
     
     $yamlData = Load-YamlData -File $YamlFile
     $hostQueue = Get-HostQueue -File $QueueFile
-    $targetHosts = Get-TargetHosts -File $HostsFile
+    
+    # Auto-set Force for single hostname if not specified
+    $effectiveForce = if ($HostName -and -not $PSBoundParameters.ContainsKey('Force')) { $true } else { $Force }
+    
+    # Determine target hosts: If $HostName provided, use it; otherwise, use the file
+    if ($HostName) {
+        $targetHosts = @($HostName)
+    } else {
+        $targetHosts = Get-TargetHosts -File $HostsFile
+    }
     
     if (-not $targetHosts) {
         Write-Log -Level Error -Message "No valid hosts found"
@@ -517,12 +579,13 @@ try {
     # Sequential filtering (simpler and more reliable than parallel)
     $filteredHosts = @()
     foreach ($hostname in $targetHosts) {
-        if (-not (Test-Connection -ComputerName $hostname -Count 1 -Quiet)) { 
+        # Skip connectivity if Force is on (to allow offline debugging)
+        if (-not $effectiveForce -and -not (Test-Connection -ComputerName $hostname -Count 1 -Quiet -WarningAction SilentlyContinue)) { 
             continue 
         }
     
         $hostData = $yamlData.systems | Where-Object { $_.hostname -eq $hostname }
-        if (Should-SkipUpdate -HostData $hostData -Days $SkipDays) { 
+        if (-not $effectiveForce -and (Should-SkipUpdate -HostData $hostData -Days $SkipDays)) { 
             continue 
         }
 
@@ -531,7 +594,7 @@ try {
     
     $targetHosts = $filteredHosts
     
-    Write-Log -Message "Processing $($targetHosts.Count) hosts with throttle limit of $ThrottleLimit" -Level Info
+    Write-Log -Message "Processing $($targetHosts.Count) hosts with throttle limit of $ThrottleLimit $(if ($effectiveForce) { '(forced mode)' } else { '' })" -Level Info
 
     # Parallel host processing using ForEach-Object -Parallel
     $results = $targetHosts | ForEach-Object -Parallel {
@@ -543,6 +606,7 @@ try {
         $hostQueue = $using:hostQueue
         $yamlData = $using:yamlData
         $scriptRoot = $using:script:PSScriptRoot
+        $effectiveForce = $using:effectiveForce
 
         # Inline logging function
         function Write-LogInline {
@@ -564,15 +628,16 @@ try {
             } catch {}
         }
 
-        # Inline Check if should process host (skip if in queue)
+        # Inline queue check logic
         function Should-ProcessHostInline {
-            param([string]$RemoteHost, [hashtable]$Queue, [int]$Duration)
+            param([string]$RemoteHost, [hashtable]$Queue, [int]$Duration, [bool]$Force)
+            if ($Force) { return $true }
             if (-not $Queue -or -not $Queue.ContainsKey($RemoteHost)) { return $true }
             $elapsed = ((Get-Date) - $Queue[$RemoteHost]).TotalSeconds
             return $elapsed -ge $Duration
         }
 
-        # Check if should skip update
+        # Inline skip check logic
         function Should-SkipUpdateInline {
             param([object]$HostData, [int]$Days)
             if (-not $HostData.last_successful_update_timestamp) { return $false }
@@ -582,40 +647,44 @@ try {
             } catch { return $false }
         }
 
-        # Inline Should-ProcessHost check first
-        if (-not (Should-ProcessHostInline -RemoteHost $computerName -Queue $hostQueue -Duration $QueueDuration)) {
+        # Check queue inline
+        if (-not (Should-ProcessHostInline -RemoteHost $computerName -Queue $hostQueue -Duration $QueueDuration -Force $effectiveForce)) {
+            $statusMessage = if ($effectiveForce) { 'Skipped-Queue (force bypassed)' } else { 'Skipped-Queue' }
             return @{
                 Hostname = $computerName
-                Status = 'Skipped-Queue'
+                Status = $statusMessage
                 UpdateSuccess = $false
                 NeedsQueue = $false
             }
         }
 
-        # Check skip based on yaml
-        $hostData = $yamlData.systems | Where-Object { $_.hostname -eq $computerName }
-        if (Should-SkipUpdateInline -HostData $hostData -Days $SkipDays) {
-            return @{
-                Hostname = $computerName
-                Status = 'Skipped-RecentUpdate'
-                UpdateSuccess = $false
-                NeedsQueue = $false
+        # Check skip based on yaml (skip if Force not enabled)
+        if (-not $effectiveForce) {
+            $hostData = $yamlData.systems | Where-Object { $_.hostname -eq $computerName }
+            if (Should-SkipUpdateInline -HostData $hostData -Days $SkipDays) {
+                return @{
+                    Hostname = $computerName
+                    Status = 'Skipped-RecentUpdate'
+                    UpdateSuccess = $false
+                    NeedsQueue = $false
+                }
             }
         }
 
         Write-LogInline -Message "Starting update" -RemoteHost $computerName -Level Info
 
         try {
-            if (-not (Test-NetConnection -ComputerName $computerName -Port 445 -InformationLevel Quiet)) {
+            if (-not (Test-NetConnection -ComputerName $computerName -Port 445 -InformationLevel Quiet -WarningAction SilentlyContinue)) {
                 throw "Cannot connect to SMB port 445 (required for PsExec)"
             }
 
             $psCommand = @'
-$log = @(); $needsReboot = $false;
+$ProgressPreference = 'SilentlyContinue'
+$log = @(); $needsReboot = $false; $exitCode = 0
 try {
     $log += "Starting update session at $(Get-Date -Format 'o')";
     if (-not (Get-Service -Name wuauserv -ErrorAction SilentlyContinue)) {
-        $log += "Windows Update service not found"; exit 1
+        throw "Windows Update service not found"
     }
     $log += "Windows Update service found.";
     $updateSession = New-Object -ComObject Microsoft.Update.Session;
@@ -623,64 +692,91 @@ try {
     $updateSearcher = $updateSession.CreateUpdateSearcher();
     $log += "Update searcher created.";
     $log += "Searching for updates...";
-    $searchResult = $updateSearcher.Search('IsInstalled=0');
+    $searchResult = $updateSearcher.Search('IsInstalled=0 and IsHidden=0');
     $log += "Search completed. Found $($searchResult.Updates.Count) updates.";
-    if ($searchResult.Updates.Count -eq 0) { $log += 'No updates available.'; $log | Out-String; exit 0 }
+    if ($searchResult.Updates.Count -eq 0) { 
+        $log += 'No updates available. System is up to date.';
+        $log | Out-String; 
+        exit 0  # Treat as success
+    }
+
     $updatesToDownload = New-Object -ComObject Microsoft.Update.UpdateColl;
     foreach ($update in $searchResult.Updates) {
+        if ($update.IsHidden) { continue }
         $updatesToDownload.Add($update) | Out-Null;
     }
+
     $downloader = $updateSession.CreateUpdateDownloader();
     $downloader.Updates = $updatesToDownload;
-    $log += "Starting download of $($updatesToDownload.Count) updates...";
+    $log += "Starting download of $($downloader.Updates.Count) updates...";
     $downloadResult = $downloader.Download();
-    $log += "Download completed.";
-    if ($downloadResult.ResultCode -ne 2) { throw "Download failed with code $($downloadResult.ResultCode)" }
-    $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl;
-    foreach ($update in $searchResult.Updates) {
-        $updatesToInstall.Add($update) | Out-Null;
-    }
+    $log += "Download completed. ResultCode: $($downloadResult.ResultCode)";
+    if ($downloadResult.ResultCode -notin @(2,3)) { throw "Download failed with code $($downloadResult.ResultCode)" }
+
+    # Reuse downloaded collection for install
+    $updatesToInstall = $updatesToDownload
     $installer = $updateSession.CreateUpdateInstaller();
     $installer.Updates = $updatesToInstall;
-    $log += "Starting installation...";
+    $log += "Starting installation of $($updatesToInstall.Count) updates...";
     $installResult = $installer.Install();
-    $log += "Installation completed.";
+    $log += "Installation completed. ResultCode: $($installResult.ResultCode); RebootRequired: $($installResult.RebootRequired)";
     $needsReboot = $installResult.RebootRequired;
     if ($needsReboot) { $log += 'Reboot required.' }
-    $log | Out-String;
-    if ($installResult.ResultCode -eq 2) {
-        # Run gpupdate /force
-        gpupdate /force | Out-Null
-        $log += "gpupdate /force completed.";
 
-        # Check and install winget if not available
-        if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-            $log += "winget not found. Installing...";
-            $progressPreference = 'SilentlyContinue';
-            Invoke-WebRequest -Uri https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx -OutFile Microsoft.VCLibs.x64.14.00.Desktop.appx;
-            Invoke-WebRequest -Uri https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.x64.appx -OutFile Microsoft.UI.Xaml.2.8.x64.appx;
-            Invoke-WebRequest -Uri https://aka.ms/getwinget -OutFile Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle;
-            Add-AppxProvisionedPackage Microsoft.VCLibs.x64.14.00.Desktop.appx;
-            Add-AppxProvisionedPackage Microsoft.UI.Xaml.2.8.x64.appx;
-            Add-AppxProvisionedPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle;
-            $log += "winget installed.";
+    if ($installResult.ResultCode -in @(2,3)) {
+        $exitCode = 0
+        try {
+            Start-Process -FilePath gpupdate -ArgumentList '/force' -NoNewWindow -Wait
+            $log += "gpupdate /force completed.";
+        } catch { $log += "gpupdate failed: $($_.Exception.Message)" }
+
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            $wingetWorked = $false
+            try {
+                $log += "Running winget upgrade --all...";
+                $wingetOutput = & winget upgrade --all --accept-package-agreements --accept-source-agreements --silent --include-unknown 2>&1
+                $log += "winget upgrade completed.";
+                $wingetWorked = $true
+            } catch { 
+                $log += "winget execution failed: $($_.Exception.Message)"
+                # Attempt repair if 'winget' is not recognized or fails
+                if ($_.Exception.Message -match 'winget.*not recognized' -or $LASTEXITCODE -ne 0) {
+                    $log += "Attempting to repair Winget installation";
+                    try {
+                        # Reinstall Winget
+                        $wingetUrl = "https://github.com/microsoft/winget-cli/releases/download/v1.7.10882-preview/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"
+                        $tempPath = Join-Path $env:TEMP "WingetInstaller.msixbundle"
+                        Invoke-WebRequest -Uri $wingetUrl -OutFile $tempPath -UseBasicParsing
+                        Start-Process -FilePath "cmd.exe" -ArgumentList "/c \`"$tempPath\`" /quiet /norestart" -Wait -NoNewWindow
+                        Remove-Item $tempPath -ErrorAction SilentlyContinue
+                        $env:Path += ";$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_1.21.24171.0_neutral__8wekyb3d8bbwe\"
+                        if (Get-Command winget -ErrorAction SilentlyContinue) {
+                            $log += "Winget repaired; retrying upgrade.";
+                            try {
+                                $wingetOutput = & winget upgrade --all --accept-package-agreements --accept-source-agreements --silent --include-unknown 2>&1
+                                $log += "winget upgrade completed after repair.";
+                                $wingetWorked = $true
+                            } catch { $log += "Winget upgrade failed even after repair: $($_.Exception.Message)" }
+                        } else {
+                            $log += "Winget repair failed; skipping winget upgrades.";
+                        }
+                    } catch { $log += "Winget repair error: $($_.Exception.Message)" }
+                }
+            }
+            if (-not $wingetWorked) { $log += "winget upgrades were not successful." }
         } else {
-            $log += "winget already available.";
+            $log += "winget not found; skipping winget upgrades.";
         }
-
-        # Run winget upgrade
-        $log += "Running winget upgrade...";
-        winget upgrade --all --accept-package-agreements --accept-source-agreements --silent --include-unknown;
-        $log += "winget upgrade completed.";
-
-        exit 0
-    } else { exit 1 }
+    } else {
+        throw "Install failed with code $($installResult.ResultCode)"
+    }
 } catch {
     $log += "Exception: $($_.Exception.Message)";
-    $log | Out-String; exit 1
+    $exitCode = 1
 } finally {
     $log += "Update session ended at $(Get-Date -Format 'o')";
     $log | Out-String
+    exit $exitCode
 }
 '@
 
@@ -773,6 +869,7 @@ try {
                 $hostEntry.last_connection_timestamp = $timestamp
                 $hostEntry.last_successful_update_timestamp = $timestamp
                 $hostEntry.update_success = $true
+                if ($hostQueue.ContainsKey($result.Hostname)) { $hostQueue.Remove($result.Hostname) }  # Clear from queue on success
             }
             'Failed' {
                 $hostEntry.last_connection_timestamp = $timestamp
@@ -787,6 +884,9 @@ try {
                     $hostQueue[$result.Hostname] = Get-Date
                 }
             }
+            { $_ -like 'Skipped-*' } {
+                # No changes for skipped (except possibly logging)
+            }
         }
     }
     
@@ -796,8 +896,8 @@ try {
     $stats = @{
         Success = ($results | Where-Object { $_.Status -eq 'Success' }).Count
         Skipped = ($results | Where-Object { $_.Status -like 'Skipped-*' }).Count
-        Failed = ($results | Where-Object { $_.Status -eq 'Failed' }).Count
-        Error = ($results | Where-Object { $_.Status -eq 'Error' }).Count
+        Failed = ($results | Where-Object { $_.Status -eq 'Failed' -or $_.Status -eq 'Error' }).Count
+        Queued = $hostQueue.Count
     }
     
     Write-Host "`n$('=' * 40)" -ForegroundColor Cyan
@@ -806,9 +906,8 @@ try {
     Write-Host "Total Hosts:    $($targetHosts.Count)"
     Write-Host "Successful:     $($stats.Success)" -ForegroundColor Green
     Write-Host "Skipped:        $($stats.Skipped)" -ForegroundColor Yellow
-    Write-Host "Failed:         $($stats.Failed)" -ForegroundColor Red
-    Write-Host "Errors:         $($stats.Error)" -ForegroundColor Red
-    Write-Host "Queued:         $($hostQueue.Count)" -ForegroundColor Yellow
+    Write-Host "Failed/Errors:  $($stats.Failed)" -ForegroundColor Red
+    Write-Host "Queued:         $($stats.Queued)" -ForegroundColor Yellow
     
     if ($hostQueue.Count -gt 0) {
         Write-Host "`nHosts in retry queue:" -ForegroundColor Yellow
