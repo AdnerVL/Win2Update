@@ -334,9 +334,9 @@ try {
             Invoke-WebRequest -Uri https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx -OutFile Microsoft.VCLibs.x64.14.00.Desktop.appx;
             Invoke-WebRequest -Uri https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.x64.appx -OutFile Microsoft.UI.Xaml.2.8.x64.appx;
             Invoke-WebRequest -Uri https://aka.ms/getwinget -OutFile Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle;
-            Add-AppxPackage Microsoft.VCLibs.x64.14.00.Desktop.appx;
-            Add-AppxPackage Microsoft.UI.Xaml.2.8.x64.appx;
-            Add-AppxPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle;
+            Add-AppxProvisionedPackage Microsoft.VCLibs.x64.14.00.Desktop.appx;
+            Add-AppxProvisionedPackage Microsoft.UI.Xaml.2.8.x64.appx;
+            Add-AppxProvisionedPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle;
             $log += "winget installed.";
         } else {
             $log += "winget already available.";
@@ -660,9 +660,9 @@ try {
             Invoke-WebRequest -Uri https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx -OutFile Microsoft.VCLibs.x64.14.00.Desktop.appx;
             Invoke-WebRequest -Uri https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.x64.appx -OutFile Microsoft.UI.Xaml.2.8.x64.appx;
             Invoke-WebRequest -Uri https://aka.ms/getwinget -OutFile Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle;
-            Add-AppxPackage Microsoft.VCLibs.x64.14.00.Desktop.appx;
-            Add-AppxPackage Microsoft.UI.Xaml.2.8.x64.appx;
-            Add-AppxPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle;
+            Add-AppxProvisionedPackage Microsoft.VCLibs.x64.14.00.Desktop.appx;
+            Add-AppxProvisionedPackage Microsoft.UI.Xaml.2.8.x64.appx;
+            Add-AppxProvisionedPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle;
             $log += "winget installed.";
         } else {
             $log += "winget already available.";
